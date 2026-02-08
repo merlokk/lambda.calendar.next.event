@@ -47,63 +47,79 @@ lambda-ics/
 ```
 
 ### Environment variables
-Name	Required	Default	Description
+|Name|Required|Default|Description|
+|--------------------|--|---------|------------------------------------|
+|ICS_URL|✅|—|Public URL to the .ics calendar|
+|TZ|❌|	Europe/Nicosia|IANA timezone for defining “today window”|
+|DEFAULT_DURATION_MIN|❌|30|Fallback duration if event has no DTEND/DURATION|
+|CACHE_MS|❌|60000|Warm-container cache duration in ms|
 
-ICS_URL	✅	—	Public URL to the .ics calendar
-TZ	❌	Europe/Nicosia	IANA timezone for defining “today window”
-DEFAULT_DURATION_MIN	❌	30	Fallback duration if event has no DTEND/DURATION
-CACHE_MS	❌	60000	Warm-container cache duration in ms
-
-TZ Examples
+**TZ Examples**
 
 TZ=UTC
+
 TZ=Europe/Nicosia
+
 TZ=Europe/Berlin
 
 ### Deploy (ZIP upload)
 1. Install dependencies locally
+
 go to the code directory
+
 npm install
+
 2) Create ZIP with dependencies
+
 zip -r lambda.zip
+
 3) Upload to Lambda
+
 AWS Console → Lambda → your function → Code: Upload from → .zip file
+
 Choose lambda.zip
-configuration:
+
+**configuration:**
+
 Runtime: Node.js 18.x/20.x
+
 Handler: index.handler
 
 4) Configure env vars
-Lambda → Configuration → Environment variables:
 
+**Lambda → Configuration → Environment variables:**
+
+```
 ICS_URL = https://example.com/calendar.ics
-
 TZ = Europe/Nicosia
+```
 
 5) Create Function URL
-Lambda → Configuration → Function URL:
+
+**Lambda → Configuration → Function URL:**
 
 Auth type: NONE (public) or your preferred auth
 
 Copy the Function URL for your client app
 
 ### Local run (quick)
-Create .env:
+**Create .env file:**
 
+```
 ICS_URL=https://example.com/calendar.ics
 TZ=Europe/Nicosia
 CACHE_MS=60000
 DEFAULT_DURATION_MIN=30
+```
 
-Run:
+**Run:**
 
-node --env-file=.env local-run.mjs
-
+`node --env-file=.env local-run.mjs`
 
 ### CloudFront in front of the calendar (recommended)
 If the original calendar host is slow (e.g., 50 seconds), put CloudFront in front of it and point ICS_URL to the CloudFront URL.
 
-Suggested CloudFront cache TTL:
+**Suggested CloudFront cache TTL:**
 
 Min: 300
 
@@ -115,14 +131,12 @@ This makes calendar fetches fast and stable for Lambda and clients.
 
 
 ### Notes / Known limitations
-The function expands recurring events for the current day window only.
+The function expands recurring events only within the current day window.
 
-Overrides via RECURRENCE-ID are handled best-effort as provided by node-ical.
+Overrides via RECURRENCE-ID are handled on a best-effort basis, as provided by node-ical.
 
 All-day events are skipped (datetype === "date").
 
 If DTEND/DURATION is missing, DEFAULT_DURATION_MIN is used. (60 min by default)
 
 
-License
-MIT (or your preferred license)
