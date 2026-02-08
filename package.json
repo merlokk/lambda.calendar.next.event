@@ -1,0 +1,10 @@
+{
+    "name": "ics-next-meeting",
+    "version": "1.0.0",
+    "type": "module",
+    "dependencies": {
+      "node-ical": "^0.20.0",
+      "rrule": "^2.8.1"
+    }
+  }
+  
