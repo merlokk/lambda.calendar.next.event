@@ -32,10 +32,13 @@ export const handler = async (event) => {
     const data = await ical.async.fromURL(ICS_URL, { method: "GET" });
     const events = Object.values(data).filter((x) => x && x.type === "VEVENT");
 
+    // build overrides
+    const overridesByUid = buildOverridesByUid(events);
+
     // Expand occurrences in [now..endOfDay) (today only)
     const occs = [];
     for (const ev of events) {
-      const expanded = expandOccurrencesInWindow(ev, nowMs, endMs);
+      const expanded = expandOccurrencesInWindow(ev, nowMs, endMs, overridesByUid);
       for (const o of expanded) {
         // keep only events that start today and after now
         if (o.startMs > nowMs && o.startMs < endMs) occs.push(o);
@@ -67,6 +70,27 @@ export const handler = async (event) => {
     return json(500, { error: String(e?.message ?? e) });
   }
 };
+
+function buildOverridesByUid(events) {
+  // Map<uid, Map<recurrenceIdMs, overrideEvent>>
+  const map = new Map();
+
+  for (const ev of events) {
+    const uid = ev.uid;
+    const recId = ev.recurrenceid; // node-ical обычно кладёт Date сюда
+    if (!uid || !(recId instanceof Date)) continue;
+
+    let inner = map.get(uid);
+    if (!inner) {
+      inner = new Map();
+      map.set(uid, inner);
+    }
+
+    inner.set(recId.getTime(), ev);
+  }
+
+  return map;
+}
 
 /**
  * Builds 3 values:
@@ -168,9 +192,10 @@ function toDto(o) {
  *  - EXDATE exclusion via ev.exdate
  *  - RECURRENCE-ID overrides via ev.recurrences (best effort)
  */
-function expandOccurrencesInWindow(ev, windowStartMs, windowEndMs) {
+function expandOccurrencesInWindow(ev, windowStartMs, windowEndMs, overridesByUid) {
   const uid = ev.uid || "";
   const baseTitle = ev.summary || "(No title)";
+  const uidOverrides = overridesByUid?.get(uid); // Map<recIdMs, overrideEvent> | undefined
 
   // Skip all-day events (node-ical often sets datetype === 'date')
   if (ev.datetype === "date") return [];
@@ -180,17 +205,30 @@ function expandOccurrencesInWindow(ev, windowStartMs, windowEndMs) {
   const baseLocation = ev.location || null;
   const baseOrganizer = organizerToString(ev.organizer);
 
-  const calcEndMs = (startDate, overrideEv) => {
-    const e = overrideEv ?? ev;
+  const calcDurationMsFromEvent = (e) => {
+    // Prefer explicit DTEND (as duration vs DTSTART), otherwise DURATION, otherwise fallback.
+    if (e?.start instanceof Date && e?.end instanceof Date) {
+      const dur = e.end.getTime() - e.start.getTime();
+      // Protect against invalid negative/zero durations
+      if (dur > 0 && dur < 7 * 24 * 60 * 60 * 1000) return dur;
+    }
 
-    // node-ical typically provides end as Date if present
-    if (e.end instanceof Date) return e.end.getTime();
+    // node-ical may provide duration in different shapes; support numeric ms if present
+    if (typeof e?.duration === "number" && e.duration > 0) return e.duration;
 
-    // duration sometimes exists (format varies); if it's a number treat as ms
-    if (typeof e.duration === "number") return startDate.getTime() + e.duration;
+    return DEFAULT_DURATION_MIN * 60_000;
+  };
 
-    // fallback duration
-    return startDate.getTime() + DEFAULT_DURATION_MIN * 60_000;
+  const calcEndMs = (occStartDate, overrideEv) => {
+    // If this specific instance (override) defines its own DTEND, use it as absolute.
+    if (overrideEv?.end instanceof Date) {
+      const endMs = overrideEv.end.getTime();
+      if (endMs > occStartDate.getTime()) return endMs;
+    }
+
+    // Otherwise: use duration from override (if any), else from master event.
+    const durMs = calcDurationMsFromEvent(overrideEv ?? ev);
+    return occStartDate.getTime() + durMs;
   };
 
   const mkOcc = (startDate, overrideEv) => {
@@ -230,15 +268,27 @@ function expandOccurrencesInWindow(ev, windowStartMs, windowEndMs) {
 
     // Overrides via RECURRENCE-ID stored in ev.recurrences.
     // Key formats vary; try a couple best-effort keys.
-    let override = null;
-    if (ev.recurrences) {
-      const k1 = d.toISOString(); // 2026-02-08T09:00:00.000Z
-      const k2 = k1.replace(".000Z", "Z"); // 2026-02-08T09:00:00Z
-      override = ev.recurrences[k2] || ev.recurrences[k1] || null;
-    }
+    //let override = null;
+
+    // Override is matched by RECURRENCE-ID (original instance start), not by new DTSTART.
+    const override = uidOverrides?.get(d.getTime()) || null;
+
+    // If the override cancels the instance (STATUS:CANCELLED) — skip it
+    if (override?.status === "CANCELLED") continue;
+
+    //if (ev.recurrences) {
+    //  const k1 = d.toISOString(); // 2026-02-08T09:00:00.000Z
+    //  const k2 = k1.replace(".000Z", "Z"); // 2026-02-08T09:00:00Z
+    //  override = ev.recurrences[k2] || ev.recurrences[k1] || null;
+    //}
 
     const startDate = (override?.start instanceof Date) ? override.start : d;
     const startMs = startDate.getTime();
+
+    if (override) {
+      console.log("OVERRIDE HIT", uid, "recId=", new Date(d.getTime()).toISOString(),
+          "newStart=", override.start?.toISOString?.());
+    }
 
     if (startMs >= windowStartMs && startMs < windowEndMs) {
       occs.push(mkOcc(startDate, override));
