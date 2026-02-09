@@ -3,8 +3,8 @@
     "version": "1.0.0",
     "type": "module",
     "dependencies": {
-      "node-ical": "^0.20.0",
-      "rrule": "^2.8.1"
+        "ical.js": "^2.2.1",
+        "rrule": "^2.8.1",
+        "windows-iana": "^5.1.0"
     }
-  }
-  
+}

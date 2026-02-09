@@ -1,50 +1,141 @@
-import ical from "node-ical";
+import ICAL from "ical.js";
+import { findIana } from "windows-iana";
 
 /**
  * ENV:
  *  - ICS_URL (required): public .ics URL
  *  - TZ (optional): timezone for "today window", default Europe/Nicosia
- *  - DEFAULT_DURATION_MIN (optional): fallback duration if no DTEND/DURATION, default 30
+ *  - DEFAULT_DURATION_MIN (optional): fallback duration if no DTEND/DURATION, default 60
  *  - CACHE_MS (optional): warm-container cache duration, default 60000
+ *  - LOG_LEVEL (optional): DEBUG, INFO, WARN, ERROR; default INFO
+ *  - OVERRIDE_NOW (optional): ISO datetime to use as "now" for testing, e.g. "2026-02-09T08:00:00Z"
  */
 const ICS_URL = process.env.ICS_URL;
 const TZ = process.env.TZ || "Europe/Nicosia";
 const DEFAULT_DURATION_MIN = Number(process.env.DEFAULT_DURATION_MIN || "60");
 const CACHE_MS = Number(process.env.CACHE_MS || "60000");
+const LOG_LEVEL = process.env.LOG_LEVEL || "INFO";
+const OVERRIDE_NOW = process.env.OVERRIDE_NOW || null;
 
 // warm-container cache (best effort)
 let cache = { at: 0, body: null };
 
+// Structured logging
+const LOG_LEVELS = { DEBUG: 0, INFO: 1, WARN: 2, ERROR: 3 };
+const currentLogLevel = LOG_LEVELS[LOG_LEVEL] ?? LOG_LEVELS.INFO;
+
+function log(level, message, meta = {}) {
+  if (LOG_LEVELS[level] >= currentLogLevel) {
+    console.log(JSON.stringify({
+      timestamp: new Date().toISOString(),
+      level,
+      message,
+      ...meta
+    }));
+  }
+}
+
 export const handler = async (event) => {
   try {
-    if (!ICS_URL) return json(500, { error: "ICS_URL env var is missing" });
+    if (!ICS_URL) {
+      log("ERROR", "ICS_URL env var is missing");
+      return json(500, { error: "ICS_URL env var is missing" });
+    }
 
-    const nowMs = Date.now();
+    // Use OVERRIDE_NOW for testing, otherwise real time
+    const nowMs = OVERRIDE_NOW ? new Date(OVERRIDE_NOW).getTime() : Date.now();
+
+    if (OVERRIDE_NOW) {
+      log("INFO", "Using overridden NOW", { override: OVERRIDE_NOW, nowMs: new Date(nowMs).toISOString() });
+    }
 
     // cache
     if (cache.body && (nowMs - cache.at) < CACHE_MS) {
+      log("DEBUG", "Cache hit");
       return json(200, cache.body, { "x-cache": "HIT" });
     }
 
     const { startMs, endMs } = todayWindow(nowMs, TZ);
+    log("INFO", "Processing calendar window", {
+      start: new Date(startMs).toISOString(),
+      end: new Date(endMs).toISOString()
+    });
 
-    // Fetch & parse ICS
-    const data = await ical.async.fromURL(ICS_URL, { method: "GET" });
-    const events = Object.values(data).filter((x) => x && x.type === "VEVENT");
+    // Fetch ICS text
+    const icsText = await fetchText(ICS_URL);
+    log("DEBUG", "Fetched ICS", { size: icsText.length });
 
-    // build overrides
-    const overridesByUid = buildOverridesByUid(events);
+    // Normalize Windows TZID -> IANA before parsing
+    const fixedIcs = normalizeIcsTimezones(icsText);
 
-    // Expand occurrences in [now..endOfDay) (today only)
+    // Parse with ical.js (better timezone support)
+    const jcalData = ICAL.parse(fixedIcs);
+    const comp = new ICAL.Component(jcalData);
+    const vevents = comp.getAllSubcomponents("vevent");
+
+    log("DEBUG", "Parsed events", { count: vevents.length });
+
+    // Convert to our format
+    const allEvents = vevents.map(vevent => parseVEvent(vevent));
+
+    // Separate master events from overrides
+    const { masterEvents, overridesByUid, masterUids } = separateMasterAndOverrides(allEvents);
+    log("DEBUG", "Separated events", {
+      masters: masterEvents.length,
+      overridesCount: overridesByUid.size
+    });
+
+    // Expand occurrences
     const occs = [];
-    for (const ev of events) {
+
+    log("DEBUG", "Filter settings", {
+      filterFrom: new Date(nowMs).toISOString()
+    });
+
+    // Process master events
+    for (const ev of masterEvents) {
       const expanded = expandOccurrencesInWindow(ev, nowMs, endMs, overridesByUid);
       for (const o of expanded) {
-        // keep only events that start today and after now
-        if (o.startMs > nowMs && o.startMs < endMs) occs.push(o);
+        if (o.startMs >= nowMs && o.startMs < endMs) occs.push(o);
       }
     }
+
+    // Process orphaned overrides
+    for (const [uid, overrideMap] of overridesByUid.entries()) {
+      if (!masterUids.has(uid)) {
+        for (const [recIdMs, override] of overrideMap.entries()) {
+          // Skip cancelled events
+          if (override.status === "CANCELLED") continue;
+          if (!override.start) continue;
+
+          const startMs = override.start.getTime();
+
+          if (startMs >= nowMs && startMs < endMs) {
+            const endMs = override.end
+                ? override.end.getTime()
+                : startMs + (DEFAULT_DURATION_MIN * 60_000);
+
+            occs.push({
+              uid: override.uid,
+              title: override.summary || "(No title)",
+              location: override.location || null,
+              organizer: override.organizer || null,
+              startMs,
+              endMs
+            });
+
+            log("INFO", "Added orphaned override", {
+              uid: override.uid,
+              title: override.summary,
+              start: override.start.toISOString()
+            });
+          }
+        }
+      }
+    }
+
     occs.sort((a, b) => a.startMs - b.startMs);
+    log("INFO", "Expanded occurrences", { count: occs.length });
 
     // Compute next/overlapping/non-overlapping
     const triple = computeNextTriple(occs, nowMs);
@@ -67,37 +158,120 @@ export const handler = async (event) => {
 
     return json(200, body, { "x-cache": "MISS" });
   } catch (e) {
+    log("ERROR", "Handler error", { error: e.message, stack: e.stack });
     return json(500, { error: String(e?.message ?? e) });
   }
 };
 
-function buildOverridesByUid(events) {
-  // Map<uid, Map<recurrenceIdMs, overrideEvent>>
-  const map = new Map();
+function parseVEvent(vevent) {
+  const event = new ICAL.Event(vevent);
 
-  for (const ev of events) {
-    const uid = ev.uid;
-    const recId = ev.recurrenceid; // node-ical обычно кладёт Date сюда
-    if (!uid || !(recId instanceof Date)) continue;
-
-    let inner = map.get(uid);
-    if (!inner) {
-      inner = new Map();
-      map.set(uid, inner);
-    }
-
-    inner.set(recId.getTime(), ev);
-  }
-
-  return map;
+  return {
+    uid: event.uid,
+    summary: event.summary || "",
+    location: event.location || null,
+    organizer: event.organizer || null,
+    start: event.startDate ? event.startDate.toJSDate() : null,
+    end: event.endDate ? event.endDate.toJSDate() : null,
+    recurrenceId: event.recurrenceId ? event.recurrenceId.toJSDate() : null,
+    rrule: event.component.getFirstPropertyValue("rrule"),
+    exdate: event.component.getAllProperties("exdate"),
+    status: event.component.getFirstPropertyValue("status"),
+    datetype: event.startDate && event.startDate.isDate ? "date" : "date-time"
+  };
 }
 
-/**
- * Builds 3 values:
- *  - next: first event starting after now
- *  - nextOverlapping: first event that overlaps next (start < next.end)
- *  - nextNonOverlapping: first event that starts after the merged overlap cluster end
- */
+async function fetchText(url, timeoutMs = 60000) {
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), timeoutMs);
+
+  try {
+    log("DEBUG", "Fetching ICS", { url });
+    const res = await fetch(url, { signal: ac.signal, redirect: "follow" });
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status} for ${url}`);
+    }
+    return await res.text();
+  } catch (e) {
+    log("ERROR", "Fetch failed", { url, error: e.message });
+    throw e;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+function normalizeIcsTimezones(icsText) {
+  return icsText.replaceAll(
+      /TZID=([^:;\r\n]+)/g,
+      (match, winTz) => {
+        const list = findIana(winTz);
+
+        if (!list || list.length === 0) {
+          log("DEBUG", "Unknown timezone", { winTz });
+          return match;
+        }
+
+        // special-case for FLE Standard Time
+        if (winTz === "FLE Standard Time") {
+          return "TZID=Europe/Nicosia";
+        }
+
+        log("DEBUG", "Mapped timezone", { from: winTz, to: list[0] });
+        return `TZID=${list[0]}`;
+      }
+  );
+}
+
+function separateMasterAndOverrides(events) {
+  const masterEvents = [];
+  const overridesByUid = new Map();
+  const masterUids = new Set();
+
+  // First pass: collect UIDs with master events
+  for (const ev of events) {
+    const uid = ev.uid;
+    if (!uid) continue;
+
+    if (!ev.recurrenceId) {
+      masterUids.add(uid);
+    }
+  }
+
+  // Second pass: separate
+  for (const ev of events) {
+    const uid = ev.uid;
+    if (!uid) {
+      log("WARN", "Event without UID", { summary: ev.summary });
+      continue;
+    }
+
+    if (!ev.recurrenceId) {
+      masterEvents.push(ev);
+    } else {
+      const recIdMs = ev.recurrenceId.getTime();
+
+      let innerMap = overridesByUid.get(uid);
+      if (!innerMap) {
+        innerMap = new Map();
+        overridesByUid.set(uid, innerMap);
+      }
+
+      innerMap.set(recIdMs, ev);
+
+      if (!masterUids.has(uid)) {
+        log("WARN", "Orphaned override (no master event)", {
+          uid,
+          recId: ev.recurrenceId.toISOString(),
+          summary: ev.summary,
+          start: ev.start?.toISOString()
+        });
+      }
+    }
+  }
+
+  return { masterEvents, overridesByUid, masterUids };
+}
+
 function computeNextTriple(occs, nowMs) {
   const nextIdx = occs.findIndex((o) => o.startMs > nowMs);
   const next = nextIdx >= 0 ? occs[nextIdx] : null;
@@ -106,18 +280,16 @@ function computeNextTriple(occs, nowMs) {
     return { next: null, nextOverlapping: null, nextNonOverlapping: null };
   }
 
-  // first overlapping with `next`
   let nextOverlapping = null;
   for (let i = nextIdx + 1; i < occs.length; i++) {
     const o = occs[i];
-    if (o.startMs >= next.endMs) break; // no longer overlaps `next`
+    if (o.startMs >= next.endMs) break;
     if (o.endMs > next.startMs) {
       nextOverlapping = o;
       break;
     }
   }
 
-  // merge chain of overlaps starting from `next`
   let clusterEnd = next.endMs;
   for (let i = nextIdx + 1; i < occs.length; i++) {
     const o = occs[i];
@@ -125,7 +297,6 @@ function computeNextTriple(occs, nowMs) {
     if (o.endMs > clusterEnd) clusterEnd = o.endMs;
   }
 
-  // first non-overlapping after cluster
   let nextNonOverlapping = null;
   for (let i = nextIdx + 1; i < occs.length; i++) {
     const o = occs[i];
@@ -142,12 +313,6 @@ function computeNextTriple(occs, nowMs) {
   };
 }
 
-/**
- * Extra metrics useful for the watch app.
- * - minutesUntilNext: minutes until next start (rounded)
- * - minutesUntilSmallAlarm: minutes until (next - 15min)
- * - isOverlappingNow: whether "now" is inside ANY event interval (today occurrences only)
- */
 function computeMetrics(occs, nowMs, nextDto) {
   const isOverlappingNow = occs.some((o) => nowMs >= o.startMs && nowMs < o.endMs);
 
@@ -181,52 +346,42 @@ function toDto(o) {
     organizer: o.organizer ?? null,
     start: new Date(o.startMs).toISOString(),
     end: new Date(o.endMs).toISOString()
+    // status is internal, don't expose to client
   };
 }
 
-/**
- * Expand occurrences in [windowStartMs .. windowEndMs] for one VEVENT.
- * Supports:
- *  - non-recurring events
- *  - RRULE expansion via ev.rrule.between()
- *  - EXDATE exclusion via ev.exdate
- *  - RECURRENCE-ID overrides via ev.recurrences (best effort)
- */
 function expandOccurrencesInWindow(ev, windowStartMs, windowEndMs, overridesByUid) {
   const uid = ev.uid || "";
   const baseTitle = ev.summary || "(No title)";
-  const uidOverrides = overridesByUid?.get(uid); // Map<recIdMs, overrideEvent> | undefined
+  const uidOverrides = overridesByUid?.get(uid);
 
-  // Skip all-day events (node-ical often sets datetype === 'date')
-  if (ev.datetype === "date") return [];
+  // Skip all-day events
+  if (ev.datetype === "date") {
+    log("DEBUG", "Skipping all-day event", { uid, title: baseTitle });
+    return [];
+  }
 
-  if (!(ev.start instanceof Date)) return [];
+  if (!ev.start) {
+    log("WARN", "Event without start date", { uid, title: baseTitle });
+    return [];
+  }
 
   const baseLocation = ev.location || null;
-  const baseOrganizer = organizerToString(ev.organizer);
+  const baseOrganizer = ev.organizer;
 
   const calcDurationMsFromEvent = (e) => {
-    // Prefer explicit DTEND (as duration vs DTSTART), otherwise DURATION, otherwise fallback.
-    if (e?.start instanceof Date && e?.end instanceof Date) {
+    if (e?.start && e?.end) {
       const dur = e.end.getTime() - e.start.getTime();
-      // Protect against invalid negative/zero durations
       if (dur > 0 && dur < 7 * 24 * 60 * 60 * 1000) return dur;
     }
-
-    // node-ical may provide duration in different shapes; support numeric ms if present
-    if (typeof e?.duration === "number" && e.duration > 0) return e.duration;
-
     return DEFAULT_DURATION_MIN * 60_000;
   };
 
   const calcEndMs = (occStartDate, overrideEv) => {
-    // If this specific instance (override) defines its own DTEND, use it as absolute.
-    if (overrideEv?.end instanceof Date) {
+    if (overrideEv?.end) {
       const endMs = overrideEv.end.getTime();
       if (endMs > occStartDate.getTime()) return endMs;
     }
-
-    // Otherwise: use duration from override (if any), else from master event.
     const durMs = calcDurationMsFromEvent(overrideEv ?? ev);
     return occStartDate.getTime() + durMs;
   };
@@ -234,91 +389,123 @@ function expandOccurrencesInWindow(ev, windowStartMs, windowEndMs, overridesByUi
   const mkOcc = (startDate, overrideEv) => {
     const title = (overrideEv?.summary ?? baseTitle) || "(No title)";
     const location = overrideEv?.location ?? baseLocation ?? null;
-    const organizer = organizerToString(overrideEv?.organizer) ?? baseOrganizer ?? null;
+    const organizer = overrideEv?.organizer ?? baseOrganizer ?? null;
+    const status = overrideEv?.status ?? ev.status;
 
     const startMs = startDate.getTime();
     const endMs = calcEndMs(startDate, overrideEv);
 
-    return { uid, title, location, organizer, startMs, endMs };
+    return { uid, title, location, organizer, startMs, endMs, status };
   };
 
   // Non-recurring
   if (!ev.rrule) {
     const startMs = ev.start.getTime();
     if (startMs >= windowStartMs && startMs < windowEndMs) {
-      return [mkOcc(ev.start, null)];
+      const occ = mkOcc(ev.start, null);
+      // Skip cancelled events
+      if (occ.status === "CANCELLED" || occ.title.startsWith("Canceled:")) {
+        log("DEBUG", "Skipping cancelled event", { uid, title: occ.title, status: occ.status });
+        return [];
+      }
+      return [occ];
     }
     return [];
   }
 
-  // Recurring: expand between window
-  const between = ev.rrule.between(new Date(windowStartMs), new Date(windowEndMs), true) || [];
-
-  const isExcluded = (d) => {
-    if (!ev.exdate) return false;
-    const t = d.getTime();
-    return Object.values(ev.exdate).some((x) => x instanceof Date && x.getTime() === t);
-  };
+  // Recurring: expand with ical.js
+  const icalEvent = new ICAL.Event(ev.component || createComponentFromEvent(ev));
+  const iterator = icalEvent.iterator();
 
   const occs = [];
+  let next;
 
-  for (const d of between) {
-    if (!(d instanceof Date)) continue;
-    if (isExcluded(d)) continue;
+  while ((next = iterator.next())) {
+    const occDate = next.toJSDate();
+    const occMs = occDate.getTime();
 
-    // Overrides via RECURRENCE-ID stored in ev.recurrences.
-    // Key formats vary; try a couple best-effort keys.
-    //let override = null;
+    // Stop if past window
+    if (occMs >= windowEndMs) break;
 
-    // Override is matched by RECURRENCE-ID (original instance start), not by new DTSTART.
-    const override = uidOverrides?.get(d.getTime()) || null;
+    // Skip if before window
+    if (occMs < windowStartMs) continue;
 
-    // If the override cancels the instance (STATUS:CANCELLED) — skip it
-    if (override?.status === "CANCELLED") continue;
+    // Check EXDATE
+    if (isExcluded(occDate, ev.exdate)) {
+      log("DEBUG", "Instance excluded by EXDATE", { uid, instance: occDate.toISOString() });
+      continue;
+    }
 
-    //if (ev.recurrences) {
-    //  const k1 = d.toISOString(); // 2026-02-08T09:00:00.000Z
-    //  const k2 = k1.replace(".000Z", "Z"); // 2026-02-08T09:00:00Z
-    //  override = ev.recurrences[k2] || ev.recurrences[k1] || null;
-    //}
+    // Check override
+    const override = uidOverrides?.get(occMs) || null;
 
-    const startDate = (override?.start instanceof Date) ? override.start : d;
+    if (override?.status === "CANCELLED") {
+      log("DEBUG", "Instance cancelled", { uid, instance: occDate.toISOString() });
+      continue;
+    }
+
+    const startDate = override?.start || occDate;
     const startMs = startDate.getTime();
 
     if (override) {
-      console.log("OVERRIDE HIT", uid, "recId=", new Date(d.getTime()).toISOString(),
-          "newStart=", override.start?.toISOString?.());
+      log("DEBUG", "Override applied", {
+        uid,
+        originalInstance: occDate.toISOString(),
+        newStart: override.start?.toISOString() || "same",
+        status: override.status
+      });
     }
 
     if (startMs >= windowStartMs && startMs < windowEndMs) {
-      occs.push(mkOcc(startDate, override));
+      const occ = mkOcc(startDate, override);
+
+      // Skip cancelled events
+      if (occ.status === "CANCELLED" || occ.title.startsWith("Canceled:")) {
+        log("DEBUG", "Skipping cancelled recurring event", {
+          uid,
+          title: occ.title,
+          status: occ.status,
+          instance: occDate.toISOString()
+        });
+        continue;
+      }
+
+      occs.push(occ);
     }
   }
 
   return occs;
 }
 
-function organizerToString(org) {
-  if (!org) return null;
+function isExcluded(date, exdates) {
+  if (!exdates || exdates.length === 0) return false;
 
-  // node-ical organizer can be a string or an object; normalize conservatively
-  if (typeof org === "string") return org;
+  const t = date.getTime();
 
-  // common shapes:
-  // - { val: 'mailto:someone@x.com', params: {...} }
-  // - { value: 'mailto:..' }
-  const v = org.val || org.value || org.mailto || null;
-  return v ? String(v) : null;
+  for (const exdate of exdates) {
+    const values = exdate.getValues();
+    for (const val of values) {
+      if (val.toJSDate().getTime() === t) return true;
+    }
+  }
+
+  return false;
 }
 
-/**
- * Compute today's window [startOfDay, endOfDay) for a given IANA TZ.
- * Uses Intl.DateTimeFormat; no extra deps.
- */
+function createComponentFromEvent(ev) {
+  // Fallback if component not available
+  const comp = new ICAL.Component("vevent");
+  comp.addPropertyWithValue("uid", ev.uid);
+  comp.addPropertyWithValue("summary", ev.summary);
+  if (ev.start) comp.addPropertyWithValue("dtstart", ICAL.Time.fromJSDate(ev.start));
+  if (ev.end) comp.addPropertyWithValue("dtend", ICAL.Time.fromJSDate(ev.end));
+  if (ev.rrule) comp.addPropertyWithValue("rrule", ev.rrule);
+  return comp;
+}
+
 function todayWindow(nowMs, timeZone) {
   const now = new Date(nowMs);
 
-  // "YYYY-MM-DD" of today in that TZ
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone,
     year: "numeric",
@@ -330,10 +517,9 @@ function todayWindow(nowMs, timeZone) {
   const m = parts.find((p) => p.type === "month")?.value;
   const d = parts.find((p) => p.type === "day")?.value;
 
-  // Approx midnight UTC for that date, then shift to zoned midnight
   const approxUtcMidnight = new Date(`${y}-${m}-${d}T00:00:00Z`);
   const startMs = shiftUtcToZonedMidnightMs(approxUtcMidnight, timeZone);
-  const endMs = startMs + 24 * 60 * 60 * 1000; // 24h
+  const endMs = startMs + 24 * 60 * 60 * 1000;
 
   return { startMs, endMs };
 }
@@ -353,26 +539,19 @@ function shiftUtcToZonedMidnightMs(utcMidnightDate, timeZone) {
   const parts = dtf.formatToParts(utcMidnightDate);
   const get = (t) => parts.find((p) => p.type === t)?.value;
 
-  // Interpret formatted zoned time as if it were UTC (Date.UTC),
-  // then compute offset relative to the real utcMidnightDate.
   const asIfUtc = Date.UTC(
-    Number(get("year")),
-    Number(get("month")) - 1,
-    Number(get("day")),
-    Number(get("hour")),
-    Number(get("minute")),
-    Number(get("second"))
+      Number(get("year")),
+      Number(get("month")) - 1,
+      Number(get("day")),
+      Number(get("hour")),
+      Number(get("minute")),
+      Number(get("second"))
   );
 
   const offsetMs = asIfUtc - utcMidnightDate.getTime();
   return utcMidnightDate.getTime() - offsetMs;
 }
 
-/**
- * ISO string "as seen in TZ" (for UI/debug). It’s not a perfect RFC3339 with offset
- * because JS doesn’t easily give the numeric offset without extra libs, but this is
- * stable for displaying time in the watch app.
- */
 function isoWithTimeZone(ms, timeZone) {
   const d = new Date(ms);
 
@@ -389,8 +568,7 @@ function isoWithTimeZone(ms, timeZone) {
 
   const get = (t) => parts.find((p) => p.type === t)?.value;
 
-  // "YYYY-MM-DDTHH:mm:ss" (без смещения)
-  return `${get("year")}-${get("month")}-${get("day")}T${get("hour")}:${get("minute")}:${get("second")}`;
+  return `${get("year")}-${get("month")}-${get("day")}T${get("hour")}:${get("minute")}:${get("second")} [${timeZone}]`;
 }
 
 function json(statusCode, obj, extraHeaders = {}) {
