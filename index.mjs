@@ -316,12 +316,16 @@ function computeNextTriple(occs, nowMs) {
 function computeMetrics(occs, nowMs, nextDto) {
   const isOverlappingNow = occs.some((o) => nowMs >= o.startMs && nowMs < o.endMs);
 
+  // Find current event if any
+  const currentEvent = occs.find((o) => nowMs >= o.startMs && nowMs < o.endMs);
+
   if (!nextDto) {
     return {
       now: isoWithTimeZone(nowMs, TZ),
       minutesUntilNext: null,
       minutesUntilSmallAlarm: null,
-      isOverlappingNow
+      isOverlappingNow,
+      current: currentEvent ? toDto(currentEvent) : null
     };
   }
 
@@ -333,7 +337,8 @@ function computeMetrics(occs, nowMs, nextDto) {
     now: isoWithTimeZone(nowMs, TZ),
     minutesUntilNext,
     minutesUntilSmallAlarm,
-    isOverlappingNow
+    isOverlappingNow,
+    current: currentEvent ? toDto(currentEvent) : null
   };
 }
 
@@ -552,9 +557,13 @@ function shiftUtcToZonedMidnightMs(utcMidnightDate, timeZone) {
   return utcMidnightDate.getTime() - offsetMs;
 }
 
+/**
+ * ISO string with timezone offset in standard format: YYYY-MM-DDTHH:mm:ss+HH:mm
+ */
 function isoWithTimeZone(ms, timeZone) {
   const d = new Date(ms);
 
+  // Get the formatted date/time in the target timezone
   const parts = new Intl.DateTimeFormat("en-GB", {
     timeZone,
     hour12: false,
@@ -568,7 +577,17 @@ function isoWithTimeZone(ms, timeZone) {
 
   const get = (t) => parts.find((p) => p.type === t)?.value;
 
-  return `${get("year")}-${get("month")}-${get("day")}T${get("hour")}:${get("minute")}:${get("second")} [${timeZone}]`;
+  // Calculate timezone offset
+  const localDate = new Date(`${get("year")}-${get("month")}-${get("day")}T${get("hour")}:${get("minute")}:${get("second")}`);
+  const utcDate = new Date(ms);
+  const offsetMinutes = Math.round((localDate.getTime() - utcDate.getTime()) / 60000);
+
+  const offsetHours = Math.floor(Math.abs(offsetMinutes) / 60);
+  const offsetMins = Math.abs(offsetMinutes) % 60;
+  const offsetSign = offsetMinutes >= 0 ? '+' : '-';
+  const offset = `${offsetSign}${String(offsetHours).padStart(2, '0')}:${String(offsetMins).padStart(2, '0')}`;
+
+  return `${get("year")}-${get("month")}-${get("day")}T${get("hour")}:${get("minute")}:${get("second")}${offset}`;
 }
 
 function json(statusCode, obj, extraHeaders = {}) {
