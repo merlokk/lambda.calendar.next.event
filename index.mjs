@@ -307,9 +307,9 @@ function computeNextTriple(occs, nowMs) {
   }
 
   return {
-    next: toDto(next),
-    nextOverlapping: toDto(nextOverlapping),
-    nextNonOverlapping: toDto(nextNonOverlapping)
+    next: toDtoWithTz(next),
+    nextOverlapping: toDtoWithTz(nextOverlapping),
+    nextNonOverlapping: toDtoWithTz(nextNonOverlapping)
   };
 }
 
@@ -323,22 +323,19 @@ function computeMetrics(occs, nowMs, nextDto) {
     return {
       now: isoWithTimeZone(nowMs, TZ),
       minutesUntilNext: null,
-      minutesUntilSmallAlarm: null,
       isOverlappingNow,
-      current: currentEvent ? toDto(currentEvent) : null
+      current: currentEvent ? toDtoWithTz(currentEvent) : null
     };
   }
 
   const nextStartMs = Date.parse(nextDto.start);
   const minutesUntilNext = Math.max(0, Math.round((nextStartMs - nowMs) / 60_000));
-  const minutesUntilSmallAlarm = Math.max(0, minutesUntilNext - 15);
 
   return {
     now: isoWithTimeZone(nowMs, TZ),
     minutesUntilNext,
-    minutesUntilSmallAlarm,
     isOverlappingNow,
-    current: currentEvent ? toDto(currentEvent) : null
+    current: currentEvent ? toDtoWithTz(currentEvent) : null
   };
 }
 
@@ -352,6 +349,18 @@ function toDto(o) {
     start: new Date(o.startMs).toISOString(),
     end: new Date(o.endMs).toISOString()
     // status is internal, don't expose to client
+  };
+}
+
+function toDtoWithTz(o) {
+  if (!o) return null;
+  return {
+    uid: o.uid,
+    title: o.title,
+    location: o.location ?? null,
+    organizer: o.organizer ?? null,
+    start: isoWithTimeZone(o.startMs, TZ),
+    end: isoWithTimeZone(o.endMs, TZ)
   };
 }
 
@@ -578,9 +587,21 @@ function isoWithTimeZone(ms, timeZone) {
   const get = (t) => parts.find((p) => p.type === t)?.value;
 
   // Calculate timezone offset
-  const localDate = new Date(`${get("year")}-${get("month")}-${get("day")}T${get("hour")}:${get("minute")}:${get("second")}`);
-  const utcDate = new Date(ms);
-  const offsetMinutes = Math.round((localDate.getTime() - utcDate.getTime()) / 60000);
+  // Create a date in the target timezone
+  const tzDateStr = `${get("year")}-${get("month")}-${get("day")}T${get("hour")}:${get("minute")}:${get("second")}`;
+
+  // Get UTC timestamp for the same "wall clock" time
+  const utcForSameWallClock = Date.UTC(
+      parseInt(get("year")),
+      parseInt(get("month")) - 1,
+      parseInt(get("day")),
+      parseInt(get("hour")),
+      parseInt(get("minute")),
+      parseInt(get("second"))
+  );
+
+  // Offset is the difference between the actual UTC time and the "wall clock" UTC time
+  const offsetMinutes = Math.round((utcForSameWallClock - ms) / 60000);
 
   const offsetHours = Math.floor(Math.abs(offsetMinutes) / 60);
   const offsetMins = Math.abs(offsetMinutes) % 60;

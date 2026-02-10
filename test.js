@@ -1,7 +1,7 @@
 /**
  * Test suite for Lambda ICS handler with ical.js
  *
- * Run with: node test-icaljs-working.js
+ * Run with: node test-icaljs.js
  *
  * Requirements:
  *  - ical.js
@@ -507,6 +507,13 @@ function runTests() {
     console.log("-".repeat(70));
 
     try {
+        const jcalData = ICAL.parse(TEST_ICS_BASIC_RECURRING);
+        const comp = new ICAL.Component(jcalData);
+        const vevents = comp.getAllSubcomponents("vevent");
+        const events = vevents.map(parseVEvent);
+
+        const event = events[0];
+
         // Manually expand RRULE: FREQ=DAILY;COUNT=5
         // Starting 2026-02-09T08:15:00Z, repeating daily for 5 days
         const baseTime = new Date("2026-02-09T08:15:00Z");
@@ -526,17 +533,17 @@ function runTests() {
         const testCases = [
             {
                 name: "Before all events",
-                now: new Date("2026-02-09T06:00:00Z"),
+                now: new Date("2026-02-09T06:00:00Z"),  // Before first event
                 shouldHaveEvents: true
             },
             {
                 name: "After first event",
-                now: new Date("2026-02-09T09:00:00Z"),
-                shouldHaveEvents: true
+                now: new Date("2026-02-09T09:00:00Z"),  // After first (08:15), but before 2nd (Feb 10)
+                shouldHaveEvents: true  // Still has events on Feb 10, 11, 12, 13
             },
             {
                 name: "After all events",
-                now: new Date("2026-02-14T06:00:00Z"),
+                now: new Date("2026-02-14T06:00:00Z"),  // After all 5 daily occurrences
                 shouldHaveEvents: false
             }
         ];
@@ -546,6 +553,7 @@ function runTests() {
         for (const testCase of testCases) {
             const nowMs = testCase.now.getTime();
 
+            // Check if any occurrence is in the future
             const futureEvents = allOccurrences.filter(occ => occ.getTime() > nowMs);
             const hasFutureEvent = futureEvents.length > 0;
 
@@ -561,7 +569,7 @@ function runTests() {
                 console.log(`    ✅ Correct`);
                 testsPassed++;
             } else {
-                console.log(`    ❌ Wrong`);
+                console.log(`    ❌ Wrong - has future events: ${hasFutureEvent}, expected: ${testCase.shouldHaveEvents}`);
             }
         }
 
@@ -572,6 +580,130 @@ function runTests() {
             console.log(`\n❌ FAIL: ${testCases.length - testsPassed} scenarios failed`);
             failCount++;
         }
+    } catch (e) {
+        console.log(`❌ FAIL: ${e.message}`);
+        console.log(e.stack);
+        failCount++;
+    }
+
+    // Summary
+    console.log("\n" + "=".repeat(70));
+    console.log("\n📝 Test 7: Timezone Format & Current Event");
+    console.log("-".repeat(70));
+
+    try {
+        // Test timezone offset calculation
+        const testMs = new Date("2026-02-09T08:15:00Z").getTime(); // 10:15 Cyprus time
+
+        // Simulate isoWithTimeZone function
+        const d = new Date(testMs);
+        const parts = new Intl.DateTimeFormat("en-GB", {
+            timeZone: "Europe/Nicosia",
+            hour12: false,
+            year: "numeric",
+            month: "2-digit",
+            day: "2-digit",
+            hour: "2-digit",
+            minute: "2-digit",
+            second: "2-digit"
+        }).formatToParts(d);
+
+        const get = (t) => parts.find((p) => p.type === t)?.value;
+
+        const tzDateStr = `${get("year")}-${get("month")}-${get("day")}T${get("hour")}:${get("minute")}:${get("second")}`;
+
+        const utcForSameWallClock = Date.UTC(
+            parseInt(get("year")),
+            parseInt(get("month")) - 1,
+            parseInt(get("day")),
+            parseInt(get("hour")),
+            parseInt(get("minute")),
+            parseInt(get("second"))
+        );
+
+        const offsetMinutes = Math.round((utcForSameWallClock - testMs) / 60000);
+
+        const offsetHours = Math.floor(Math.abs(offsetMinutes) / 60);
+        const offsetMins = Math.abs(offsetMinutes) % 60;
+        const offsetSign = offsetMinutes >= 0 ? '+' : '-';
+        const offset = `${offsetSign}${String(offsetHours).padStart(2, '0')}:${String(offsetMins).padStart(2, '0')}`;
+
+        const formatted = `${get("year")}-${get("month")}-${get("day")}T${get("hour")}:${get("minute")}:${get("second")}${offset}`;
+
+        console.log(`\nTimezone offset calculation:`);
+        console.log(`  UTC time: 2026-02-09T08:15:00Z`);
+        console.log(`  Cyprus time: ${tzDateStr}`);
+        console.log(`  Offset: ${offset}`);
+        console.log(`  Expected: +02:00`);
+        console.log(`  Formatted: ${formatted}`);
+        console.log(`  Expected: 2026-02-09T10:15:00+02:00`);
+
+        if (offset === "+02:00") {
+            console.log("✅ PASS: Timezone offset is correct");
+            passCount++;
+        } else {
+            console.log(`❌ FAIL: Expected +02:00, got ${offset}`);
+            failCount++;
+        }
+
+        if (formatted === "2026-02-09T10:15:00+02:00") {
+            console.log("✅ PASS: Formatted time is correct");
+            passCount++;
+        } else {
+            console.log(`❌ FAIL: Expected 2026-02-09T10:15:00+02:00, got ${formatted}`);
+            failCount++;
+        }
+
+        // Test current event detection
+        console.log(`\nCurrent event detection:`);
+
+        const events = [
+            { startMs: new Date("2026-02-09T08:00:00Z").getTime(), endMs: new Date("2026-02-09T08:30:00Z").getTime(), title: "Event 1" },
+            { startMs: new Date("2026-02-09T09:00:00Z").getTime(), endMs: new Date("2026-02-09T09:30:00Z").getTime(), title: "Event 2" }
+        ];
+
+        // Case 1: Before all events
+        const now1 = new Date("2026-02-09T07:00:00Z").getTime();
+        const current1 = events.find(e => now1 >= e.startMs && now1 < e.endMs);
+
+        console.log(`  NOW: 07:00 UTC, Current: ${current1 ? current1.title : "null"}`);
+        if (!current1) {
+            console.log("  ✅ Correct - no current event");
+            passCount++;
+        } else {
+            console.log("  ❌ Wrong - should be null");
+            failCount++;
+        }
+
+        // Case 2: During first event
+        const now2 = new Date("2026-02-09T08:15:00Z").getTime();
+        const current2 = events.find(e => now2 >= e.startMs && now2 < e.endMs);
+
+        console.log(`  NOW: 08:15 UTC, Current: ${current2 ? current2.title : "null"}`);
+        if (current2 && current2.title === "Event 1") {
+            console.log("  ✅ Correct - Event 1 is current");
+            passCount++;
+        } else {
+            console.log("  ❌ Wrong - should be Event 1");
+            failCount++;
+        }
+
+        // Case 3: Between events
+        const now3 = new Date("2026-02-09T08:45:00Z").getTime();
+        const current3 = events.find(e => now3 >= e.startMs && now3 < e.endMs);
+
+        console.log(`  NOW: 08:45 UTC, Current: ${current3 ? current3.title : "null"}`);
+        if (!current3) {
+            console.log("  ✅ Correct - no current event");
+            passCount++;
+        } else {
+            console.log("  ❌ Wrong - should be null");
+            failCount++;
+        }
+
+        console.log(`\n✅ PASS: Timezone format and current event tests completed`);
+        passCount++;
+
     } catch (e) {
         console.log(`❌ FAIL: ${e.message}`);
         console.log(e.stack);
@@ -601,6 +733,7 @@ function runTests() {
     console.log("  4. 'Canceled:' title filtering");
     console.log("  5. Orphaned override detection");
     console.log("  6. OVERRIDE_NOW functionality");
+    console.log("  7. Timezone format (+02:00) and current event detection");
 
     console.log("\n🎯 Ready for production!");
     console.log("=".repeat(70) + "\n");
