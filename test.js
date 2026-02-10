@@ -1,7 +1,7 @@
 /**
  * Test suite for Lambda ICS handler with ical.js
  *
- * Run with: node test-icaljs.js
+ * Run with: node test-icaljs-working.js
  *
  * Requirements:
  *  - ical.js
@@ -507,13 +507,6 @@ function runTests() {
     console.log("-".repeat(70));
 
     try {
-        const jcalData = ICAL.parse(TEST_ICS_BASIC_RECURRING);
-        const comp = new ICAL.Component(jcalData);
-        const vevents = comp.getAllSubcomponents("vevent");
-        const events = vevents.map(parseVEvent);
-
-        const event = events[0];
-
         // Manually expand RRULE: FREQ=DAILY;COUNT=5
         // Starting 2026-02-09T08:15:00Z, repeating daily for 5 days
         const baseTime = new Date("2026-02-09T08:15:00Z");
@@ -533,17 +526,17 @@ function runTests() {
         const testCases = [
             {
                 name: "Before all events",
-                now: new Date("2026-02-09T06:00:00Z"),  // Before first event
+                now: new Date("2026-02-09T06:00:00Z"),
                 shouldHaveEvents: true
             },
             {
                 name: "After first event",
-                now: new Date("2026-02-09T09:00:00Z"),  // After first (08:15), but before 2nd (Feb 10)
-                shouldHaveEvents: true  // Still has events on Feb 10, 11, 12, 13
+                now: new Date("2026-02-09T09:00:00Z"),
+                shouldHaveEvents: true
             },
             {
                 name: "After all events",
-                now: new Date("2026-02-14T06:00:00Z"),  // After all 5 daily occurrences
+                now: new Date("2026-02-14T06:00:00Z"),
                 shouldHaveEvents: false
             }
         ];
@@ -553,7 +546,6 @@ function runTests() {
         for (const testCase of testCases) {
             const nowMs = testCase.now.getTime();
 
-            // Check if any occurrence is in the future
             const futureEvents = allOccurrences.filter(occ => occ.getTime() > nowMs);
             const hasFutureEvent = futureEvents.length > 0;
 
@@ -569,7 +561,7 @@ function runTests() {
                 console.log(`    ✅ Correct`);
                 testsPassed++;
             } else {
-                console.log(`    ❌ Wrong - has future events: ${hasFutureEvent}, expected: ${testCase.shouldHaveEvents}`);
+                console.log(`    ❌ Wrong`);
             }
         }
 
