@@ -59,8 +59,18 @@ export const handler = async (event) => {
     const nowOverride = params.now || OVERRIDE_NOW;
     const tz = params.tz || TZ;
 
+    if (!isValidTimeZone(tz)) {
+      log("WARN", "Invalid timezone", { tz });
+      return json(400, { error: `Invalid timezone: ${tz}` });
+    }
+
     // Use overridden NOW for testing, otherwise real time
-    const nowMs = nowOverride ? new Date(nowOverride).getTime() : Date.now();
+    const nowMs = nowOverride ? Date.parse(nowOverride) : Date.now();
+
+    if (!Number.isFinite(nowMs)) {
+      log("WARN", "Invalid NOW override", { override: nowOverride });
+      return json(400, { error: `Invalid now override: ${nowOverride}` });
+    }
 
     if (nowOverride) {
       log("INFO", "Using overridden NOW", { override: nowOverride, nowMs: new Date(nowMs).toISOString() });
@@ -668,9 +678,23 @@ function todayWindow(nowMs, timeZone) {
 
   const approxUtcMidnight = new Date(`${y}-${m}-${d}T00:00:00Z`);
   const startMs = shiftUtcToZonedMidnightMs(approxUtcMidnight, timeZone);
-  const endMs = startMs + 24 * 60 * 60 * 1000;
+
+  // Next local midnight can be ±1h around DST transitions,
+  // so don't assume day length is always 24h.
+  const nextDayApproxUtcMidnight = new Date(`${y}-${m}-${d}T00:00:00Z`);
+  nextDayApproxUtcMidnight.setUTCDate(nextDayApproxUtcMidnight.getUTCDate() + 1);
+  const endMs = shiftUtcToZonedMidnightMs(nextDayApproxUtcMidnight, timeZone);
 
   return { startMs, endMs };
+}
+
+function isValidTimeZone(timeZone) {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function shiftUtcToZonedMidnightMs(utcMidnightDate, timeZone) {
