@@ -3,12 +3,20 @@ import { findIana } from "windows-iana";
 
 /**
  * ENV:
- *  - ICS_URL (required): public .ics URL
+ *  - ICS_URL (required for production): public .ics URL
  *  - TZ (optional): timezone for "today window", default Europe/Nicosia
  *  - DEFAULT_DURATION_MIN (optional): fallback duration if no DTEND/DURATION, default 60
  *  - CACHE_MS (optional): warm-container cache duration, default 60000
  *  - LOG_LEVEL (optional): DEBUG, INFO, WARN, ERROR; default INFO
  *  - OVERRIDE_NOW (optional): ISO datetime to use as "now" for testing, e.g. "2026-02-09T08:00:00Z"
+ *
+ * Query Parameters (for testing):
+ *  - now (optional): Override NOW timestamp, e.g. "2026-02-09T08:20:00Z"
+ *  - tz (optional): Override timezone, e.g. "UTC" or "Europe/Nicosia"
+ *
+ * Request Body (for testing):
+ *  - Base64-encoded ICS file content (set isBase64Encoded: true)
+ *  - When provided, ICS_URL is not required and caching is disabled
  */
 const ICS_URL = process.env.ICS_URL;
 const TZ = process.env.TZ || "Europe/Nicosia";
@@ -37,33 +45,48 @@ function log(level, message, meta = {}) {
 
 export const handler = async (event) => {
   try {
-    if (!ICS_URL) {
+    // Check if ICS is provided in request body (for testing)
+    const hasInlineIcs = event.body && event.isBase64Encoded;
+    const icsUrl = hasInlineIcs ? null : ICS_URL;
+
+    if (!hasInlineIcs && !icsUrl) {
       log("ERROR", "ICS_URL env var is missing");
       return json(500, { error: "ICS_URL env var is missing" });
     }
 
-    // Use OVERRIDE_NOW for testing, otherwise real time
-    const nowMs = OVERRIDE_NOW ? new Date(OVERRIDE_NOW).getTime() : Date.now();
+    // Parse query params for NOW override and timezone
+    const params = event.queryStringParameters || {};
+    const nowOverride = params.now || OVERRIDE_NOW;
+    const tz = params.tz || TZ;
 
-    if (OVERRIDE_NOW) {
-      log("INFO", "Using overridden NOW", { override: OVERRIDE_NOW, nowMs: new Date(nowMs).toISOString() });
+    // Use overridden NOW for testing, otherwise real time
+    const nowMs = nowOverride ? new Date(nowOverride).getTime() : Date.now();
+
+    if (nowOverride) {
+      log("INFO", "Using overridden NOW", { override: nowOverride, nowMs: new Date(nowMs).toISOString() });
     }
 
-    // cache
-    if (cache.body && (nowMs - cache.at) < CACHE_MS) {
+    // Only use cache for URL-based ICS (not inline test ICS)
+    if (!hasInlineIcs && cache.body && (nowMs - cache.at) < CACHE_MS) {
       log("DEBUG", "Cache hit");
       return json(200, cache.body, { "x-cache": "HIT" });
     }
 
-    const { startMs, endMs } = todayWindow(nowMs, TZ);
+    const { startMs, endMs } = todayWindow(nowMs, tz);
     log("INFO", "Processing calendar window", {
       start: new Date(startMs).toISOString(),
       end: new Date(endMs).toISOString()
     });
 
-    // Fetch ICS text
-    const icsText = await fetchText(ICS_URL);
-    log("DEBUG", "Fetched ICS", { size: icsText.length });
+    // Fetch ICS text from URL or decode from request body
+    let icsText;
+    if (hasInlineIcs) {
+      icsText = Buffer.from(event.body, 'base64').toString('utf-8');
+      log("DEBUG", "Using inline ICS from request body", { size: icsText.length });
+    } else {
+      icsText = await fetchText(icsUrl);
+      log("DEBUG", "Fetched ICS from URL", { size: icsText.length });
+    }
 
     // Normalize Windows TZID -> IANA before parsing
     const fixedIcs = normalizeIcsTimezones(icsText);
@@ -80,23 +103,18 @@ export const handler = async (event) => {
 
     // Separate master events from overrides
     const { masterEvents, overridesByUid, masterUids } = separateMasterAndOverrides(allEvents);
-    log("DEBUG", "Separated events", {
-      masters: masterEvents.length,
-      overridesCount: overridesByUid.size
-    });
 
     // Expand occurrences
     const occs = [];
 
-    log("DEBUG", "Filter settings", {
-      filterFrom: new Date(nowMs).toISOString()
-    });
-
     // Process master events
     for (const ev of masterEvents) {
-      const expanded = expandOccurrencesInWindow(ev, nowMs, endMs, overridesByUid);
+      const expanded = expandOccurrencesInWindow(ev, startMs, endMs, overridesByUid);
+
       for (const o of expanded) {
-        if (o.startMs >= nowMs && o.startMs < endMs) occs.push(o);
+        // Include event if it overlaps with the window [nowMs, endMs)
+        // Event overlaps if: starts before window ends AND ends after window starts
+        if (o.startMs < endMs && o.endMs > nowMs) occs.push(o);
       }
     }
 
@@ -108,20 +126,22 @@ export const handler = async (event) => {
           if (override.status === "CANCELLED") continue;
           if (!override.start) continue;
 
-          const startMs = override.start.getTime();
+          const occStartMs = override.start.getTime();
 
-          if (startMs >= nowMs && startMs < endMs) {
-            const endMs = override.end
+          // Orphaned overrides check against window boundaries (not nowMs)
+          // because they are standalone events without a master to expand from
+          if (occStartMs >= startMs && occStartMs < endMs) {
+            const occEndMs = override.end
                 ? override.end.getTime()
-                : startMs + (DEFAULT_DURATION_MIN * 60_000);
+                : occStartMs + (DEFAULT_DURATION_MIN * 60_000);
 
             occs.push({
               uid: override.uid,
               title: override.summary || "(No title)",
               location: override.location || null,
               organizer: override.organizer || null,
-              startMs,
-              endMs
+              startMs: occStartMs,
+              endMs: occEndMs
             });
 
             log("INFO", "Added orphaned override", {
@@ -138,23 +158,26 @@ export const handler = async (event) => {
     log("INFO", "Expanded occurrences", { count: occs.length });
 
     // Compute next/overlapping/non-overlapping
-    const triple = computeNextTriple(occs, nowMs);
+    const triple = computeNextTriple(occs, nowMs, tz);
 
     // Metrics
-    const metrics = computeMetrics(occs, nowMs, triple.next);
+    const metrics = computeMetrics(occs, nowMs, triple.next, tz);
 
     const body = {
       generatedAt: new Date().toISOString(),
       window: {
-        start: isoWithTimeZone(startMs, TZ),
-        end: isoWithTimeZone(endMs, TZ),
-        tz: TZ
+        start: isoWithTimeZone(startMs, tz),
+        end: isoWithTimeZone(endMs, tz),
+        tz: tz
       },
       ...metrics,
       ...triple
     };
 
-    cache = { at: nowMs, body };
+    // Only cache URL-based results (not inline test ICS)
+    if (!hasInlineIcs) {
+      cache = { at: nowMs, body };
+    }
 
     return json(200, body, { "x-cache": "MISS" });
   } catch (e) {
@@ -177,7 +200,8 @@ function parseVEvent(vevent) {
     rrule: event.component.getFirstPropertyValue("rrule"),
     exdate: event.component.getAllProperties("exdate"),
     status: event.component.getFirstPropertyValue("status"),
-    datetype: event.startDate && event.startDate.isDate ? "date" : "date-time"
+    datetype: event.startDate && event.startDate.isDate ? "date" : "date-time",
+    component: vevent  // Preserve component for proper timezone handling in iterator
   };
 }
 
@@ -201,9 +225,22 @@ async function fetchText(url, timeoutMs = 60000) {
 }
 
 function normalizeIcsTimezones(icsText) {
+  // Extract all VTIMEZONE TZIDs from the file
+  const vtzRegex = /BEGIN:VTIMEZONE[\s\S]*?TZID:([^\r\n]+)[\s\S]*?END:VTIMEZONE/g;
+  const vtimezones = new Set();
+  let match;
+  while ((match = vtzRegex.exec(icsText)) !== null) {
+    vtimezones.add(match[1]);
+  }
+
   return icsText.replaceAll(
       /TZID=([^:;\r\n]+)/g,
       (match, winTz) => {
+        // If this timezone has a VTIMEZONE definition, keep it as-is
+        if (vtimezones.has(winTz)) {
+          return match;
+        }
+
         const list = findIana(winTz);
 
         if (!list || list.length === 0) {
@@ -214,6 +251,11 @@ function normalizeIcsTimezones(icsText) {
         // special-case for FLE Standard Time
         if (winTz === "FLE Standard Time") {
           return "TZID=Europe/Nicosia";
+        }
+
+        // special-case for Pacific Standard Time
+        if (winTz === "Pacific Standard Time") {
+          return "TZID=America/Los_Angeles";
         }
 
         log("DEBUG", "Mapped timezone", { from: winTz, to: list[0] });
@@ -272,8 +314,15 @@ function separateMasterAndOverrides(events) {
   return { masterEvents, overridesByUid, masterUids };
 }
 
-function computeNextTriple(occs, nowMs) {
-  const nextIdx = occs.findIndex((o) => o.startMs > nowMs);
+function computeNextTriple(occs, nowMs, tz) {
+  // Find current event (if any)
+  const currentEvent = occs.find((o) => nowMs >= o.startMs && nowMs < o.endMs);
+
+  // Next event is:
+  // - If there's a current event: first event starting after current ends
+  // - If no current event: first event starting after NOW
+  const searchFromMs = currentEvent ? currentEvent.endMs : nowMs;
+  const nextIdx = occs.findIndex((o) => o.startMs >= searchFromMs);
   const next = nextIdx >= 0 ? occs[nextIdx] : null;
 
   if (!next) {
@@ -307,13 +356,13 @@ function computeNextTriple(occs, nowMs) {
   }
 
   return {
-    next: toDtoWithTz(next),
-    nextOverlapping: toDtoWithTz(nextOverlapping),
-    nextNonOverlapping: toDtoWithTz(nextNonOverlapping)
+    next: toDtoWithTz(next, tz),
+    nextOverlapping: toDtoWithTz(nextOverlapping, tz),
+    nextNonOverlapping: toDtoWithTz(nextNonOverlapping, tz)
   };
 }
 
-function computeMetrics(occs, nowMs, nextDto) {
+function computeMetrics(occs, nowMs, nextDto, tz) {
   const isOverlappingNow = occs.some((o) => nowMs >= o.startMs && nowMs < o.endMs);
 
   // Find current event if any
@@ -321,10 +370,10 @@ function computeMetrics(occs, nowMs, nextDto) {
 
   if (!nextDto) {
     return {
-      now: isoWithTimeZone(nowMs, TZ),
+      now: isoWithTimeZone(nowMs, tz),
       minutesUntilNext: null,
       isOverlappingNow,
-      current: currentEvent ? toDtoWithTz(currentEvent) : null
+      current: currentEvent ? toDtoWithTz(currentEvent, tz) : null
     };
   }
 
@@ -332,10 +381,10 @@ function computeMetrics(occs, nowMs, nextDto) {
   const minutesUntilNext = Math.max(0, Math.round((nextStartMs - nowMs) / 60_000));
 
   return {
-    now: isoWithTimeZone(nowMs, TZ),
+    now: isoWithTimeZone(nowMs, tz),
     minutesUntilNext,
     isOverlappingNow,
-    current: currentEvent ? toDtoWithTz(currentEvent) : null
+    current: currentEvent ? toDtoWithTz(currentEvent, tz) : null
   };
 }
 
@@ -352,15 +401,15 @@ function toDto(o) {
   };
 }
 
-function toDtoWithTz(o) {
+function toDtoWithTz(o, tz) {
   if (!o) return null;
   return {
     uid: o.uid,
     title: o.title,
     location: o.location ?? null,
     organizer: o.organizer ?? null,
-    start: isoWithTimeZone(o.startMs, TZ),
-    end: isoWithTimeZone(o.endMs, TZ)
+    start: isoWithTimeZone(o.startMs, tz),
+    end: isoWithTimeZone(o.endMs, tz)
   };
 }
 
@@ -369,9 +418,22 @@ function expandOccurrencesInWindow(ev, windowStartMs, windowEndMs, overridesByUi
   const baseTitle = ev.summary || "(No title)";
   const uidOverrides = overridesByUid?.get(uid);
 
+  // Debug for specific missing events
+  const isDebugEvent = uid.includes("6sbcikm6oikp3qe52m1576ivu2");
+
+  if (isDebugEvent) {
+    log("INFO", "=== DEBUG SARDINE EVENT ===", {
+      uid,
+      summary: baseTitle,
+      hasRrule: !!ev.rrule,
+      dtstart: ev.start ? ev.start.toISOString() : null,
+      windowStart: new Date(windowStartMs).toISOString(),
+      windowEnd: new Date(windowEndMs).toISOString()
+    });
+  }
+
   // Skip all-day events
   if (ev.datetype === "date") {
-    log("DEBUG", "Skipping all-day event", { uid, title: baseTitle });
     return [];
   }
 
@@ -415,11 +477,15 @@ function expandOccurrencesInWindow(ev, windowStartMs, windowEndMs, overridesByUi
   // Non-recurring
   if (!ev.rrule) {
     const startMs = ev.start.getTime();
-    if (startMs >= windowStartMs && startMs < windowEndMs) {
+    const endMs = ev.end ? ev.end.getTime() : startMs + (DEFAULT_DURATION_MIN * 60_000);
+
+    // Check if event overlaps with window (handles currently happening events)
+    const overlapsWindow = startMs < windowEndMs && endMs > windowStartMs;
+
+    if (overlapsWindow) {
       const occ = mkOcc(ev.start, null);
       // Skip cancelled events
       if (occ.status === "CANCELLED" || occ.title.startsWith("Canceled:")) {
-        log("DEBUG", "Skipping cancelled event", { uid, title: occ.title, status: occ.status });
         return [];
       }
       return [occ];
@@ -432,26 +498,48 @@ function expandOccurrencesInWindow(ev, windowStartMs, windowEndMs, overridesByUi
   const iterator = icalEvent.iterator();
 
   const occs = [];
+  const usedOverrides = new Set(); // Track which overrides were used
   let next;
+  let instanceCount = 0;
 
   while ((next = iterator.next())) {
+    instanceCount++;
     const occDate = next.toJSDate();
-    const occMs = occDate.getTime();
+    const occMs = next.toJSDate().getTime();
+
+    if (isDebugEvent && (instanceCount <= 2 || instanceCount >= 57)) {
+      log("INFO", "Iterator", {
+        instance: occDate.toISOString(),
+        num: instanceCount
+      });
+    }
 
     // Stop if past window
-    if (occMs >= windowEndMs) break;
+    if (occMs >= windowEndMs) {
+      if (isDebugEvent) {
+        log("INFO", "Iterator stopped - past window");
+      }
+      break;
+    }
 
-    // Skip if before window
-    if (occMs < windowStartMs) continue;
+    // Smart skip: Events that ended before window starts can't overlap
+    // Assume max event duration is 24 hours for safety
+    const maxEventDuration = 24 * 60 * 60 * 1000; // 24 hours in ms
+    if (occMs + maxEventDuration < windowStartMs) {
+      continue; // Skip events that ended long before window
+    }
 
     // Check EXDATE
     if (isExcluded(occDate, ev.exdate)) {
-      log("DEBUG", "Instance excluded by EXDATE", { uid, instance: occDate.toISOString() });
       continue;
     }
 
     // Check override
     const override = uidOverrides?.get(occMs) || null;
+
+    if (override) {
+      usedOverrides.add(occMs); // Mark as used
+    }
 
     if (override?.status === "CANCELLED") {
       log("DEBUG", "Instance cancelled", { uid, instance: occDate.toISOString() });
@@ -461,30 +549,77 @@ function expandOccurrencesInWindow(ev, windowStartMs, windowEndMs, overridesByUi
     const startDate = override?.start || occDate;
     const startMs = startDate.getTime();
 
-    if (override) {
-      log("DEBUG", "Override applied", {
-        uid,
-        originalInstance: occDate.toISOString(),
-        newStart: override.start?.toISOString() || "same",
-        status: override.status
-      });
-    }
+    // Calculate end time using the same logic as mkOcc
+    const endMs = calcEndMs(startDate, override);
 
-    if (startMs >= windowStartMs && startMs < windowEndMs) {
+    // Check if event overlaps with window (handles currently happening events)
+    const overlapsWindow = startMs < windowEndMs && endMs > windowStartMs;
+
+    if (overlapsWindow) {
       const occ = mkOcc(startDate, override);
 
       // Skip cancelled events
       if (occ.status === "CANCELLED" || occ.title.startsWith("Canceled:")) {
-        log("DEBUG", "Skipping cancelled recurring event", {
-          uid,
-          title: occ.title,
-          status: occ.status,
-          instance: occDate.toISOString()
-        });
         continue;
       }
 
       occs.push(occ);
+    }
+  }
+
+  if (isDebugEvent) {
+    log("INFO", "=== EXPANSION COMPLETE ===", {
+      uid,
+      summary: baseTitle,
+      totalIterations: instanceCount,
+      occurrencesReturned: occs.length,
+      firstOcc: occs[0] ? new Date(occs[0].startMs).toISOString() : null,
+      iteratorEndedNaturally: !next  // true if iterator.next() returned null
+    });
+  }
+
+  // Add any unused overrides as standalone events
+  // These are overrides that fall outside the RRULE range or were skipped
+  if (uidOverrides) {
+    for (const [recIdMs, override] of uidOverrides.entries()) {
+      const wasUsed = usedOverrides.has(recIdMs);
+
+      if (wasUsed) continue;
+
+      // Skip cancelled
+      if (override.status === "CANCELLED") continue;
+      if (!override.start) continue;
+
+      const occStartMs = override.start.getTime();
+      const occEndMs = override.end
+          ? override.end.getTime()
+          : occStartMs + (DEFAULT_DURATION_MIN * 60_000);
+
+      // Check if event overlaps with window (handles currently happening events)
+      const isInWindow = occStartMs < windowEndMs && occEndMs > windowStartMs;
+
+      if (isInWindow) {
+        const title = override.summary || baseTitle || "(No title)";
+
+        // Skip cancelled
+        if (title.startsWith("Canceled:")) continue;
+
+        occs.push({
+          uid: override.uid,
+          title,
+          location: override.location || baseLocation || null,
+          organizer: override.organizer || baseOrganizer || null,
+          startMs: occStartMs,
+          endMs: occEndMs
+        });
+
+        log("INFO", "Added unused override as standalone event", {
+          uid: override.uid,
+          title,
+          start: override.start.toISOString(),
+          recId: new Date(recIdMs).toISOString()
+        });
+      }
     }
   }
 
