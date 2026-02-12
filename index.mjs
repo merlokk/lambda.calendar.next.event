@@ -56,8 +56,10 @@ export const handler = async (event) => {
 
     // Parse query params for NOW override and timezone
     const params = event.queryStringParameters || {};
-    const nowOverride = params.now || OVERRIDE_NOW;
-    const tz = params.tz || TZ;
+    const hasNowOverride = typeof params.now === "string" && params.now.trim() !== "";
+    const hasTzOverride = typeof params.tz === "string" && params.tz.trim() !== "";
+    const nowOverride = hasNowOverride ? params.now : OVERRIDE_NOW;
+    const tz = hasTzOverride ? params.tz : TZ;
 
     if (!isValidTimeZone(tz)) {
       log("WARN", "Invalid timezone", { tz });
@@ -65,7 +67,7 @@ export const handler = async (event) => {
     }
 
     // Use overridden NOW for testing, otherwise real time
-    const nowMs = nowOverride ? Date.parse(nowOverride) : Date.now();
+    const nowMs = nowOverride ? parseIsoDateTime(nowOverride) : Date.now();
 
     if (!Number.isFinite(nowMs)) {
       log("WARN", "Invalid NOW override", { override: nowOverride });
@@ -76,8 +78,10 @@ export const handler = async (event) => {
       log("INFO", "Using overridden NOW", { override: nowOverride, nowMs: new Date(nowMs).toISOString() });
     }
 
-    // Only use cache for URL-based ICS (not inline test ICS)
-    if (!hasInlineIcs && cache.body && (nowMs - cache.at) < CACHE_MS) {
+    const hasQueryOverrides = hasNowOverride || hasTzOverride;
+
+    // Only use cache for URL-based ICS without query overrides.
+    if (!hasInlineIcs && !hasQueryOverrides && cache.body && (Date.now() - cache.at) < CACHE_MS) {
       log("DEBUG", "Cache hit");
       return json(200, cache.body, { "x-cache": "HIT" });
     }
@@ -186,7 +190,7 @@ export const handler = async (event) => {
 
     // Only cache URL-based results (not inline test ICS)
     if (!hasInlineIcs) {
-      cache = { at: nowMs, body };
+      cache = { at: Date.now(), body };
     }
 
     return json(200, body, { "x-cache": "MISS" });
@@ -660,6 +664,16 @@ function createComponentFromEvent(ev) {
   if (ev.end) comp.addPropertyWithValue("dtend", ICAL.Time.fromJSDate(ev.end));
   if (ev.rrule) comp.addPropertyWithValue("rrule", ev.rrule);
   return comp;
+}
+
+function parseIsoDateTime(value) {
+  if (typeof value !== "string") return NaN;
+
+  // Avoid locale-dependent parsing: require explicit timezone.
+  const hasExplicitOffset = /([zZ]|[+-]\d{2}:\d{2})$/.test(value);
+  if (!hasExplicitOffset) return NaN;
+
+  return Date.parse(value);
 }
 
 function todayWindow(nowMs, timeZone) {
