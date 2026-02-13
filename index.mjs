@@ -418,20 +418,6 @@ function expandOccurrencesInWindow(ev, windowStartMs, windowEndMs, overridesByUi
   const baseTitle = ev.summary || "(No title)";
   const uidOverrides = overridesByUid?.get(uid);
 
-  // Debug for specific missing events
-  const isDebugEvent = uid.includes("6sbcikm6oikp3qe52m1576ivu2");
-
-  if (isDebugEvent) {
-    log("INFO", "=== DEBUG SARDINE EVENT ===", {
-      uid,
-      summary: baseTitle,
-      hasRrule: !!ev.rrule,
-      dtstart: ev.start ? ev.start.toISOString() : null,
-      windowStart: new Date(windowStartMs).toISOString(),
-      windowEnd: new Date(windowEndMs).toISOString()
-    });
-  }
-
   // Skip all-day events
   if (ev.datetype === "date") {
     return [];
@@ -507,18 +493,8 @@ function expandOccurrencesInWindow(ev, windowStartMs, windowEndMs, overridesByUi
     const occDate = next.toJSDate();
     const occMs = next.toJSDate().getTime();
 
-    if (isDebugEvent && (instanceCount <= 2 || instanceCount >= 57)) {
-      log("INFO", "Iterator", {
-        instance: occDate.toISOString(),
-        num: instanceCount
-      });
-    }
-
     // Stop if past window
     if (occMs >= windowEndMs) {
-      if (isDebugEvent) {
-        log("INFO", "Iterator stopped - past window");
-      }
       break;
     }
 
@@ -565,17 +541,6 @@ function expandOccurrencesInWindow(ev, windowStartMs, windowEndMs, overridesByUi
 
       occs.push(occ);
     }
-  }
-
-  if (isDebugEvent) {
-    log("INFO", "=== EXPANSION COMPLETE ===", {
-      uid,
-      summary: baseTitle,
-      totalIterations: instanceCount,
-      occurrencesReturned: occs.length,
-      firstOcc: occs[0] ? new Date(occs[0].startMs).toISOString() : null,
-      iteratorEndedNaturally: !next  // true if iterator.next() returned null
-    });
   }
 
   // Add any unused overrides as standalone events

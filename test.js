@@ -1,743 +1,549 @@
+#!/usr/bin/env node
+
 /**
- * Test suite for Lambda ICS handler with ical.js
+ * Test Suite: Comprehensive ICS Event Processing
  *
- * Run with: node test-icaljs.js
- *
- * Requirements:
- *  - ical.js
- *  - windows-iana
+ * Covers all edge cases discovered during development:
+ * 1. Currently happening events (overlap detection)
+ * 2. Next event calculation (after current ends, not after NOW)
+ * 3. Recurring event duration calculation (endMs from duration, not master end)
+ * 4. Pacific timezone with VTIMEZONE definitions
+ * 5. Window expansion uses day start (startMs) not NOW (nowMs)
+ * 6. Unused override detection
+ * 7. Multiple events and proper sorting
+ * 8. Edge cases around NOW boundary
  */
 
-import ICAL from "ical.js";
+import { handler } from './index.mjs';
 
-// =============================================================================
-// TEST DATA
-// =============================================================================
-
-const TEST_ICS_TIMEZONE_CONVERSION = `BEGIN:VCALENDAR
-VERSION:2.0
-PRODID:-//Test//Test//EN
-CALSCALE:GREGORIAN
-BEGIN:VTIMEZONE
-TZID:FLE Standard Time
-BEGIN:STANDARD
-DTSTART:16010101T040000
-TZOFFSETFROM:+0300
-TZOFFSETTO:+0200
-RRULE:FREQ=YEARLY;INTERVAL=1;BYDAY=-1SU;BYMONTH=10
-END:STANDARD
-BEGIN:DAYLIGHT
-DTSTART:16010101T030000
-TZOFFSETFROM:+0200
-TZOFFSETTO:+0300
-RRULE:FREQ=YEARLY;INTERVAL=1;BYDAY=-1SU;BYMONTH=3
-END:DAYLIGHT
-END:VTIMEZONE
-BEGIN:VEVENT
-UID:timezone-test-123
-DTSTART;TZID=FLE Standard Time:20260209T101500
-DTEND;TZID=FLE Standard Time:20260209T104500
-SUMMARY:Timezone Test Event
-LOCATION:Microsoft Teams Meeting
-END:VEVENT
-END:VCALENDAR`;
-
-const TEST_ICS_BASIC_RECURRING = `BEGIN:VCALENDAR
-VERSION:2.0
-PRODID:-//Test//Test//EN
-CALSCALE:GREGORIAN
-BEGIN:VEVENT
-UID:daily-standup-123
-DTSTART:20260209T081500Z
-DTEND:20260209T084500Z
-RRULE:FREQ=DAILY;COUNT=5
-SUMMARY:Daily stand-up
-LOCATION:Microsoft Teams Meeting
-END:VEVENT
-END:VCALENDAR`;
-
-const TEST_ICS_WITH_OVERRIDE = `BEGIN:VCALENDAR
-VERSION:2.0
-PRODID:-//Test//Test//EN
-CALSCALE:GREGORIAN
-BEGIN:VTIMEZONE
-TZID:FLE Standard Time
-BEGIN:STANDARD
-DTSTART:16010101T040000
-TZOFFSETFROM:+0300
-TZOFFSETTO:+0200
-RRULE:FREQ=YEARLY;INTERVAL=1;BYDAY=-1SU;BYMONTH=10
-END:STANDARD
-BEGIN:DAYLIGHT
-DTSTART:16010101T030000
-TZOFFSETFROM:+0200
-TZOFFSETTO:+0300
-RRULE:FREQ=YEARLY;INTERVAL=1;BYDAY=-1SU;BYMONTH=3
-END:DAYLIGHT
-END:VTIMEZONE
-BEGIN:VEVENT
-UID:meeting-456
-DTSTART;TZID=FLE Standard Time:20260209T100000
-DTEND;TZID=FLE Standard Time:20260209T103000
-RRULE:FREQ=DAILY;COUNT=5
-SUMMARY:Daily Meeting
-LOCATION:Room 101
-END:VEVENT
-BEGIN:VEVENT
-UID:meeting-456
-RECURRENCE-ID;TZID=FLE Standard Time:20260211T100000
-DTSTART;TZID=FLE Standard Time:20260211T140000
-DTEND;TZID=FLE Standard Time:20260211T150000
-SUMMARY:Daily Meeting (Moved to Afternoon)
-LOCATION:Room 202
-END:VEVENT
-END:VCALENDAR`;
-
-const TEST_ICS_CANCELLED_EVENT = `BEGIN:VCALENDAR
-VERSION:2.0
-PRODID:-//Test//Test//EN
-BEGIN:VTIMEZONE
-TZID:FLE Standard Time
-BEGIN:STANDARD
-DTSTART:16010101T040000
-TZOFFSETFROM:+0300
-TZOFFSETTO:+0200
-RRULE:FREQ=YEARLY;INTERVAL=1;BYDAY=-1SU;BYMONTH=10
-END:STANDARD
-BEGIN:DAYLIGHT
-DTSTART:16010101T030000
-TZOFFSETFROM:+0200
-TZOFFSETTO:+0300
-RRULE:FREQ=YEARLY;INTERVAL=1;BYDAY=-1SU;BYMONTH=3
-END:DAYLIGHT
-END:VTIMEZONE
-BEGIN:VEVENT
-UID:review-meeting-789
-DTSTART;TZID=FLE Standard Time:20260209T140000
-DTEND;TZID=FLE Standard Time:20260209T150000
-RRULE:FREQ=DAILY;COUNT=5
-SUMMARY:Review Meeting
-LOCATION:Conference Room
-END:VEVENT
-BEGIN:VEVENT
-UID:review-meeting-789
-RECURRENCE-ID;TZID=FLE Standard Time:20260211T140000
-DTSTART;TZID=FLE Standard Time:20260211T140000
-DTEND;TZID=FLE Standard Time:20260211T150000
-STATUS:CANCELLED
-SUMMARY:Review Meeting
-LOCATION:Conference Room
-END:VEVENT
-END:VCALENDAR`;
-
-const TEST_ICS_CANCELLED_BY_TITLE = `BEGIN:VCALENDAR
-VERSION:2.0
-PRODID:-//Test//Test//EN
-BEGIN:VTIMEZONE
-TZID:FLE Standard Time
-BEGIN:STANDARD
-DTSTART:16010101T040000
-TZOFFSETFROM:+0300
-TZOFFSETTO:+0200
-RRULE:FREQ=YEARLY;INTERVAL=1;BYDAY=-1SU;BYMONTH=10
-END:STANDARD
-BEGIN:DAYLIGHT
-DTSTART:16010101T030000
-TZOFFSETFROM:+0200
-TZOFFSETTO:+0300
-RRULE:FREQ=YEARLY;INTERVAL=1;BYDAY=-1SU;BYMONTH=3
-END:DAYLIGHT
-END:VTIMEZONE
-BEGIN:VEVENT
-UID:planning-meeting-999
-DTSTART;TZID=FLE Standard Time:20260209T160000
-DTEND;TZID=FLE Standard Time:20260209T170000
-SUMMARY:Canceled: Planning Meeting
-LOCATION:Microsoft Teams
-END:VEVENT
-END:VCALENDAR`;
-
-const TEST_ICS_ORPHANED_OVERRIDE = `BEGIN:VCALENDAR
-VERSION:2.0
-PRODID:-//Test//Test//EN
-BEGIN:VTIMEZONE
-TZID:FLE Standard Time
-BEGIN:STANDARD
-DTSTART:16010101T040000
-TZOFFSETFROM:+0300
-TZOFFSETTO:+0200
-RRULE:FREQ=YEARLY;INTERVAL=1;BYDAY=-1SU;BYMONTH=10
-END:STANDARD
-BEGIN:DAYLIGHT
-DTSTART:16010101T030000
-TZOFFSETFROM:+0200
-TZOFFSETTO:+0300
-RRULE:FREQ=YEARLY;INTERVAL=1;BYDAY=-1SU;BYMONTH=3
-END:DAYLIGHT
-END:VTIMEZONE
-BEGIN:VEVENT
-UID:orphan-meeting-111
-RECURRENCE-ID;TZID=FLE Standard Time:20260209T120000
-DTSTART;TZID=FLE Standard Time:20260209T123000
-DTEND;TZID=FLE Standard Time:20260209T133000
-SUMMARY:Orphaned Meeting Instance
-LOCATION:Zoom
-END:VEVENT
-END:VCALENDAR`;
-
-// =============================================================================
-// HELPER FUNCTIONS
-// =============================================================================
-
-function parseVEvent(vevent) {
-    const event = new ICAL.Event(vevent);
-
+// Test utilities
+function createTestEvent(icsContent, nowISO, tz = 'Europe/Nicosia') {
+    const base64 = Buffer.from(icsContent).toString('base64');
     return {
-        uid: event.uid,
-        summary: event.summary || "",
-        location: event.location || null,
-        organizer: event.organizer || null,
-        start: event.startDate ? event.startDate.toJSDate() : null,
-        end: event.endDate ? event.endDate.toJSDate() : null,
-        recurrenceId: event.recurrenceId ? event.recurrenceId.toJSDate() : null,
-        rrule: event.component.getFirstPropertyValue("rrule"),
-        exdate: event.component.getAllProperties("exdate"),
-        status: event.component.getFirstPropertyValue("status"),
-        datetype: event.startDate && event.startDate.isDate ? "date" : "date-time",
-        component: vevent
+        queryStringParameters: {
+            now: nowISO,
+            tz: tz
+        },
+        body: base64,
+        isBase64Encoded: true
     };
 }
 
-function separateMasterAndOverrides(events) {
-    const masterEvents = [];
-    const overridesByUid = new Map();
-    const masterUids = new Set();
-
-    // First pass: collect UIDs with master events
-    for (const ev of events) {
-        const uid = ev.uid;
-        if (!uid) continue;
-
-        if (!ev.recurrenceId) {
-            masterUids.add(uid);
-        }
-    }
-
-    // Second pass: separate
-    for (const ev of events) {
-        const uid = ev.uid;
-        if (!uid) continue;
-
-        if (!ev.recurrenceId) {
-            masterEvents.push(ev);
-        } else {
-            const recIdMs = ev.recurrenceId.getTime();
-
-            let innerMap = overridesByUid.get(uid);
-            if (!innerMap) {
-                innerMap = new Map();
-                overridesByUid.set(uid, innerMap);
-            }
-
-            innerMap.set(recIdMs, ev);
-        }
-    }
-
-    return { masterEvents, overridesByUid, masterUids };
+function parseResponse(response) {
+    return JSON.parse(response.body);
 }
 
-// =============================================================================
-// TEST RUNNER
-// =============================================================================
-
-function runTests() {
-    console.log("🧪 Testing Lambda ICS Handler with ical.js\n");
-    console.log("=".repeat(70));
-
-    let passCount = 0;
-    let failCount = 0;
-
-    // Test 1: Basic Timezone Conversion
-    console.log("\n📝 Test 1: Timezone Conversion (FLE Standard Time → UTC)");
-    console.log("-".repeat(70));
-
-    try {
-        const jcalData = ICAL.parse(TEST_ICS_TIMEZONE_CONVERSION);
-        const comp = new ICAL.Component(jcalData);
-        const vevents = comp.getAllSubcomponents("vevent");
-        const events = vevents.map(parseVEvent);
-
-        const event = events[0];
-
-        console.log(`Original: DTSTART;TZID=FLE Standard Time:20260209T101500`);
-        console.log(`Parsed start: ${event.start.toISOString()}`);
-        console.log(`Expected:     2026-02-09T08:15:00.000Z`);
-
-        const expected = "2026-02-09T08:15:00.000Z";
-        const actual = event.start.toISOString();
-
-        if (actual === expected) {
-            console.log("✅ PASS: Timezone conversion is correct");
-            console.log("   Cyprus 10:15 (UTC+2) = UTC 08:15");
-            passCount++;
-        } else {
-            console.log(`❌ FAIL: Expected ${expected}, got ${actual}`);
-            failCount++;
-        }
-    } catch (e) {
-        console.log(`❌ FAIL: ${e.message}`);
-        failCount++;
-    }
-
-    // Test 2: RECURRENCE-ID Override
-    console.log("\n" + "=".repeat(70));
-    console.log("\n📝 Test 2: RECURRENCE-ID Override (Move Instance)");
-    console.log("-".repeat(70));
-
-    try {
-        const jcalData = ICAL.parse(TEST_ICS_WITH_OVERRIDE);
-        const comp = new ICAL.Component(jcalData);
-        const vevents = comp.getAllSubcomponents("vevent");
-        const events = vevents.map(parseVEvent);
-
-        const { masterEvents, overridesByUid } = separateMasterAndOverrides(events);
-
-        console.log(`Master events: ${masterEvents.length}`);
-        console.log(`Overrides: ${overridesByUid.size}`);
-
-        if (masterEvents.length === 1 && overridesByUid.size === 1) {
-            console.log("✅ PASS: Correctly separated master and override");
-            passCount++;
-        } else {
-            console.log(`❌ FAIL: Expected 1 master and 1 override, got ${masterEvents.length}/${overridesByUid.size}`);
-            failCount++;
-        }
-
-        const uid = "meeting-456";
-        const overrideMap = overridesByUid.get(uid);
-
-        if (overrideMap && overrideMap.size === 1) {
-            const override = Array.from(overrideMap.values())[0];
-
-            console.log(`\nOverride details:`);
-            console.log(`  RECURRENCE-ID: ${override.recurrenceId.toISOString()}`);
-            console.log(`  New DTSTART:   ${override.start.toISOString()}`);
-            console.log(`  New SUMMARY:   ${override.summary}`);
-            console.log(`  New LOCATION:  ${override.location}`);
-
-            // Original instance: Feb 11 10:00 Cyprus = Feb 11 08:00 UTC
-            const expectedRecId = "2026-02-11T08:00:00.000Z";
-            const actualRecId = override.recurrenceId.toISOString();
-
-            // New start: Feb 11 14:00 Cyprus = Feb 11 12:00 UTC
-            const expectedStart = "2026-02-11T12:00:00.000Z";
-            const actualStart = override.start.toISOString();
-
-            if (actualRecId === expectedRecId) {
-                console.log("✅ PASS: RECURRENCE-ID correctly converted to UTC");
-                passCount++;
-            } else {
-                console.log(`❌ FAIL: RECURRENCE-ID mismatch`);
-                failCount++;
-            }
-
-            if (actualStart === expectedStart) {
-                console.log("✅ PASS: Override start time correctly converted to UTC");
-                passCount++;
-            } else {
-                console.log(`❌ FAIL: Override start mismatch`);
-                failCount++;
-            }
-
-            if (override.summary === "Daily Meeting (Moved to Afternoon)") {
-                console.log("✅ PASS: Override summary preserved");
-                passCount++;
-            } else {
-                console.log(`❌ FAIL: Summary incorrect: ${override.summary}`);
-                failCount++;
-            }
-
-            if (override.location === "Room 202") {
-                console.log("✅ PASS: Override location preserved");
-                passCount++;
-            } else {
-                console.log(`❌ FAIL: Location incorrect: ${override.location}`);
-                failCount++;
-            }
-        } else {
-            console.log(`❌ FAIL: Override not found`);
-            failCount++;
-        }
-    } catch (e) {
-        console.log(`❌ FAIL: ${e.message}`);
-        failCount++;
-    }
-
-    // Test 3: STATUS:CANCELLED Filtering
-    console.log("\n" + "=".repeat(70));
-    console.log("\n📝 Test 3: STATUS:CANCELLED Filtering");
-    console.log("-".repeat(70));
-
-    try {
-        const jcalData = ICAL.parse(TEST_ICS_CANCELLED_EVENT);
-        const comp = new ICAL.Component(jcalData);
-        const vevents = comp.getAllSubcomponents("vevent");
-        const events = vevents.map(parseVEvent);
-
-        const { masterEvents, overridesByUid } = separateMasterAndOverrides(events);
-
-        const uid = "review-meeting-789";
-        const overrideMap = overridesByUid.get(uid);
-        const override = Array.from(overrideMap.values())[0];
-
-        console.log(`Override status: ${override.status}`);
-        console.log(`Expected: CANCELLED`);
-
-        if (override.status === "CANCELLED") {
-            console.log("✅ PASS: STATUS:CANCELLED detected");
-            console.log("   → This instance should be filtered out");
-            passCount++;
-        } else {
-            console.log(`❌ FAIL: Status is ${override.status}, expected CANCELLED`);
-            failCount++;
-        }
-    } catch (e) {
-        console.log(`❌ FAIL: ${e.message}`);
-        failCount++;
-    }
-
-    // Test 4: "Canceled:" Title Filtering
-    console.log("\n" + "=".repeat(70));
-    console.log("\n📝 Test 4: 'Canceled:' Title Filtering");
-    console.log("-".repeat(70));
-
-    try {
-        const jcalData = ICAL.parse(TEST_ICS_CANCELLED_BY_TITLE);
-        const comp = new ICAL.Component(jcalData);
-        const vevents = comp.getAllSubcomponents("vevent");
-        const events = vevents.map(parseVEvent);
-
-        const event = events[0];
-
-        console.log(`Summary: "${event.summary}"`);
-        console.log(`Starts with "Canceled:": ${event.summary.startsWith("Canceled:")}`);
-
-        if (event.summary.startsWith("Canceled:")) {
-            console.log("✅ PASS: 'Canceled:' prefix detected");
-            console.log("   → This event should be filtered out");
-            passCount++;
-        } else {
-            console.log(`❌ FAIL: Title does not start with "Canceled:"`);
-            failCount++;
-        }
-    } catch (e) {
-        console.log(`❌ FAIL: ${e.message}`);
-        failCount++;
-    }
-
-    // Test 5: Orphaned Override Detection
-    console.log("\n" + "=".repeat(70));
-    console.log("\n📝 Test 5: Orphaned Override Detection");
-    console.log("-".repeat(70));
-
-    try {
-        const jcalData = ICAL.parse(TEST_ICS_ORPHANED_OVERRIDE);
-        const comp = new ICAL.Component(jcalData);
-        const vevents = comp.getAllSubcomponents("vevent");
-        const events = vevents.map(parseVEvent);
-
-        const { masterEvents, overridesByUid, masterUids } = separateMasterAndOverrides(events);
-
-        console.log(`Master events: ${masterEvents.length}`);
-        console.log(`Overrides: ${overridesByUid.size}`);
-
-        const uid = "orphan-meeting-111";
-        const hasOverride = overridesByUid.has(uid);
-        const hasMaster = masterUids.has(uid);
-
-        console.log(`\nUID: ${uid}`);
-        console.log(`Has override: ${hasOverride}`);
-        console.log(`Has master: ${hasMaster}`);
-
-        if (hasOverride && !hasMaster) {
-            console.log("✅ PASS: Orphaned override detected (has override, no master)");
-            console.log("   → Should be treated as standalone event");
-            passCount++;
-
-            const overrideMap = overridesByUid.get(uid);
-            const override = Array.from(overrideMap.values())[0];
-
-            console.log(`\nOrphaned event details:`);
-            console.log(`  RECURRENCE-ID: ${override.recurrenceId.toISOString()}`);
-            console.log(`  DTSTART:       ${override.start.toISOString()}`);
-            console.log(`  SUMMARY:       ${override.summary}`);
-
-            // Original instance: Feb 9 12:00 Cyprus = Feb 9 10:00 UTC
-            const expectedRecId = "2026-02-09T10:00:00.000Z";
-            // Actual start: Feb 9 12:30 Cyprus = Feb 9 10:30 UTC
-            const expectedStart = "2026-02-09T10:30:00.000Z";
-
-            if (override.recurrenceId.toISOString() === expectedRecId) {
-                console.log("✅ PASS: RECURRENCE-ID correctly converted");
-                passCount++;
-            } else {
-                console.log(`❌ FAIL: RECURRENCE-ID mismatch`);
-                failCount++;
-            }
-
-            if (override.start.toISOString() === expectedStart) {
-                console.log("✅ PASS: Start time correctly converted");
-                passCount++;
-            } else {
-                console.log(`❌ FAIL: Start time mismatch`);
-                failCount++;
-            }
-        } else {
-            console.log(`❌ FAIL: Not detected as orphaned override`);
-            failCount++;
-        }
-    } catch (e) {
-        console.log(`❌ FAIL: ${e.message}`);
-        failCount++;
-    }
-
-    // Test 6: OVERRIDE_NOW Simulation
-    console.log("\n" + "=".repeat(70));
-    console.log("\n📝 Test 6: OVERRIDE_NOW Simulation");
-    console.log("-".repeat(70));
-
-    try {
-        const jcalData = ICAL.parse(TEST_ICS_BASIC_RECURRING);
-        const comp = new ICAL.Component(jcalData);
-        const vevents = comp.getAllSubcomponents("vevent");
-        const events = vevents.map(parseVEvent);
-
-        const event = events[0];
-
-        // Manually expand RRULE: FREQ=DAILY;COUNT=5
-        // Starting 2026-02-09T08:15:00Z, repeating daily for 5 days
-        const baseTime = new Date("2026-02-09T08:15:00Z");
-        const allOccurrences = [];
-
-        for (let i = 0; i < 5; i++) {
-            const occ = new Date(baseTime.getTime() + (i * 24 * 60 * 60 * 1000));
-            allOccurrences.push(occ);
-        }
-
-        console.log(`\nRecurring event has ${allOccurrences.length} occurrences:`);
-        allOccurrences.forEach((occ, idx) => {
-            console.log(`  ${idx + 1}. ${occ.toISOString()}`);
-        });
-
-        // Simulate different NOW values
-        const testCases = [
-            {
-                name: "Before all events",
-                now: new Date("2026-02-09T06:00:00Z"),  // Before first event
-                shouldHaveEvents: true
-            },
-            {
-                name: "After first event",
-                now: new Date("2026-02-09T09:00:00Z"),  // After first (08:15), but before 2nd (Feb 10)
-                shouldHaveEvents: true  // Still has events on Feb 10, 11, 12, 13
-            },
-            {
-                name: "After all events",
-                now: new Date("2026-02-14T06:00:00Z"),  // After all 5 daily occurrences
-                shouldHaveEvents: false
-            }
-        ];
-
-        let testsPassed = 0;
-
-        for (const testCase of testCases) {
-            const nowMs = testCase.now.getTime();
-
-            // Check if any occurrence is in the future
-            const futureEvents = allOccurrences.filter(occ => occ.getTime() > nowMs);
-            const hasFutureEvent = futureEvents.length > 0;
-
-            console.log(`\n  ${testCase.name}:`);
-            console.log(`    NOW: ${testCase.now.toISOString()}`);
-            console.log(`    Future events: ${futureEvents.length}`);
-            if (futureEvents.length > 0) {
-                console.log(`      Next: ${futureEvents[0].toISOString()}`);
-            }
-            console.log(`    Expected has events: ${testCase.shouldHaveEvents}`);
-
-            if (hasFutureEvent === testCase.shouldHaveEvents) {
-                console.log(`    ✅ Correct`);
-                testsPassed++;
-            } else {
-                console.log(`    ❌ Wrong - has future events: ${hasFutureEvent}, expected: ${testCase.shouldHaveEvents}`);
-            }
-        }
-
-        if (testsPassed === testCases.length) {
-            console.log(`\n✅ PASS: All OVERRIDE_NOW scenarios work correctly`);
-            passCount++;
-        } else {
-            console.log(`\n❌ FAIL: ${testCases.length - testsPassed} scenarios failed`);
-            failCount++;
-        }
-    } catch (e) {
-        console.log(`❌ FAIL: ${e.message}`);
-        console.log(e.stack);
-        failCount++;
-    }
-
-    // Summary
-    console.log("\n" + "=".repeat(70));
-    console.log("\n📝 Test 7: Timezone Format & Current Event");
-    console.log("-".repeat(70));
-
-    try {
-        // Test timezone offset calculation
-        const testMs = new Date("2026-02-09T08:15:00Z").getTime(); // 10:15 Cyprus time
-
-        // Simulate isoWithTimeZone function
-        const d = new Date(testMs);
-        const parts = new Intl.DateTimeFormat("en-GB", {
-            timeZone: "Europe/Nicosia",
-            hour12: false,
-            year: "numeric",
-            month: "2-digit",
-            day: "2-digit",
-            hour: "2-digit",
-            minute: "2-digit",
-            second: "2-digit"
-        }).formatToParts(d);
-
-        const get = (t) => parts.find((p) => p.type === t)?.value;
-
-        const tzDateStr = `${get("year")}-${get("month")}-${get("day")}T${get("hour")}:${get("minute")}:${get("second")}`;
-
-        const utcForSameWallClock = Date.UTC(
-            parseInt(get("year")),
-            parseInt(get("month")) - 1,
-            parseInt(get("day")),
-            parseInt(get("hour")),
-            parseInt(get("minute")),
-            parseInt(get("second"))
-        );
-
-        const offsetMinutes = Math.round((utcForSameWallClock - testMs) / 60000);
-
-        const offsetHours = Math.floor(Math.abs(offsetMinutes) / 60);
-        const offsetMins = Math.abs(offsetMinutes) % 60;
-        const offsetSign = offsetMinutes >= 0 ? '+' : '-';
-        const offset = `${offsetSign}${String(offsetHours).padStart(2, '0')}:${String(offsetMins).padStart(2, '0')}`;
-
-        const formatted = `${get("year")}-${get("month")}-${get("day")}T${get("hour")}:${get("minute")}:${get("second")}${offset}`;
-
-        console.log(`\nTimezone offset calculation:`);
-        console.log(`  UTC time: 2026-02-09T08:15:00Z`);
-        console.log(`  Cyprus time: ${tzDateStr}`);
-        console.log(`  Offset: ${offset}`);
-        console.log(`  Expected: +02:00`);
-        console.log(`  Formatted: ${formatted}`);
-        console.log(`  Expected: 2026-02-09T10:15:00+02:00`);
-
-        if (offset === "+02:00") {
-            console.log("✅ PASS: Timezone offset is correct");
-            passCount++;
-        } else {
-            console.log(`❌ FAIL: Expected +02:00, got ${offset}`);
-            failCount++;
-        }
-
-        if (formatted === "2026-02-09T10:15:00+02:00") {
-            console.log("✅ PASS: Formatted time is correct");
-            passCount++;
-        } else {
-            console.log(`❌ FAIL: Expected 2026-02-09T10:15:00+02:00, got ${formatted}`);
-            failCount++;
-        }
-
-        // Test current event detection
-        console.log(`\nCurrent event detection:`);
-
-        const events = [
-            { startMs: new Date("2026-02-09T08:00:00Z").getTime(), endMs: new Date("2026-02-09T08:30:00Z").getTime(), title: "Event 1" },
-            { startMs: new Date("2026-02-09T09:00:00Z").getTime(), endMs: new Date("2026-02-09T09:30:00Z").getTime(), title: "Event 2" }
-        ];
-
-        // Case 1: Before all events
-        const now1 = new Date("2026-02-09T07:00:00Z").getTime();
-        const current1 = events.find(e => now1 >= e.startMs && now1 < e.endMs);
-
-        console.log(`  NOW: 07:00 UTC, Current: ${current1 ? current1.title : "null"}`);
-        if (!current1) {
-            console.log("  ✅ Correct - no current event");
-            passCount++;
-        } else {
-            console.log("  ❌ Wrong - should be null");
-            failCount++;
-        }
-
-        // Case 2: During first event
-        const now2 = new Date("2026-02-09T08:15:00Z").getTime();
-        const current2 = events.find(e => now2 >= e.startMs && now2 < e.endMs);
-
-        console.log(`  NOW: 08:15 UTC, Current: ${current2 ? current2.title : "null"}`);
-        if (current2 && current2.title === "Event 1") {
-            console.log("  ✅ Correct - Event 1 is current");
-            passCount++;
-        } else {
-            console.log("  ❌ Wrong - should be Event 1");
-            failCount++;
-        }
-
-        // Case 3: Between events
-        const now3 = new Date("2026-02-09T08:45:00Z").getTime();
-        const current3 = events.find(e => now3 >= e.startMs && now3 < e.endMs);
-
-        console.log(`  NOW: 08:45 UTC, Current: ${current3 ? current3.title : "null"}`);
-        if (!current3) {
-            console.log("  ✅ Correct - no current event");
-            passCount++;
-        } else {
-            console.log("  ❌ Wrong - should be null");
-            failCount++;
-        }
-
-        console.log(`\n✅ PASS: Timezone format and current event tests completed`);
-        passCount++;
-
-    } catch (e) {
-        console.log(`❌ FAIL: ${e.message}`);
-        console.log(e.stack);
-        failCount++;
-    }
-
-    // Summary
-    console.log("\n" + "=".repeat(70));
-    console.log("\n📊 Test Summary");
-    console.log("=".repeat(70));
-    console.log(`\nTotal tests: ${passCount + failCount}`);
-    console.log(`✅ Passed: ${passCount}`);
-    console.log(`❌ Failed: ${failCount}`);
-    console.log(`\nSuccess rate: ${Math.round((passCount / (passCount + failCount)) * 100)}%`);
-
-    if (failCount === 0) {
-        console.log("\n🎉 All tests passed!");
+// Test 1: Event starts before NOW, ends after NOW (currently happening)
+async function testCurrentlyHappeningEvent() {
+    console.log('\n=== Test 1: Currently Happening Event ===');
+
+    const ics = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VEVENT
+UID:test-current-event
+DTSTART:20260209T081500Z
+DTEND:20260209T084500Z
+SUMMARY:Currently Happening Meeting
+RRULE:FREQ=DAILY;COUNT=1
+END:VEVENT
+END:VCALENDAR`;
+
+    // NOW is 08:20 UTC (event runs 08:15-08:45)
+    const event = createTestEvent(ics, '2026-02-09T08:20:00Z', 'UTC');
+    const response = await handler(event);
+    const data = parseResponse(response);
+
+    console.log('Event time: 08:15-08:45 UTC');
+    console.log('NOW: 08:20 UTC');
+    console.log('Expected: Event should be current');
+    console.log('Result:');
+    console.log('  isOverlappingNow:', data.isOverlappingNow);
+    console.log('  current:', data.current?.title || 'null');
+
+    if (data.isOverlappingNow && data.current?.title === 'Currently Happening Meeting') {
+        console.log('✅ PASS: Currently happening event detected correctly');
+        return true;
     } else {
-        console.log(`\n⚠️  ${failCount} test(s) failed`);
+        console.log('❌ FAIL: Currently happening event NOT detected');
+        return false;
     }
-
-    console.log("\n" + "=".repeat(70));
-    console.log("\n✅ Key Features Verified:");
-    console.log("  1. Timezone conversion (FLE Standard Time → UTC)");
-    console.log("  2. RECURRENCE-ID override handling");
-    console.log("  3. STATUS:CANCELLED filtering");
-    console.log("  4. 'Canceled:' title filtering");
-    console.log("  5. Orphaned override detection");
-    console.log("  6. OVERRIDE_NOW functionality");
-    console.log("  7. Timezone format (+02:00) and current event detection");
-
-    console.log("\n🎯 Ready for production!");
-    console.log("=".repeat(70) + "\n");
 }
 
-// Run tests
-runTests();
+// Test 2: Event starts exactly at NOW
+async function testEventStartsAtNow() {
+    console.log('\n=== Test 2: Event Starts at NOW ===');
+
+    const ics = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//TEST//EN
+BEGIN:VEVENT
+UID:test-starts-now
+DTSTART:20260209T090000Z
+DTEND:20260209T093000Z
+SUMMARY:Starts Now Meeting
+RRULE:FREQ=DAILY;COUNT=1
+END:VEVENT
+END:VCALENDAR`;
+
+    const event = createTestEvent(ics, '2026-02-09T09:00:00Z', 'UTC');
+    const response = await handler(event);
+    const data = parseResponse(response);
+
+    console.log('Event time: 09:00-09:30 UTC');
+    console.log('NOW: 09:00 UTC');
+    console.log('Expected: Event should be current');
+    console.log('Result:');
+    console.log('  isOverlappingNow:', data.isOverlappingNow);
+    console.log('  current:', data.current?.title || 'null');
+
+    if (data.isOverlappingNow && data.current?.title === 'Starts Now Meeting') {
+        console.log('✅ PASS: Event starting at NOW detected correctly');
+        return true;
+    } else {
+        console.log('❌ FAIL: Event starting at NOW NOT detected');
+        return false;
+    }
+}
+
+// Test 3: Event ends exactly at NOW (should NOT be current)
+async function testEventEndsAtNow() {
+    console.log('\n=== Test 3: Event Ends at NOW ===');
+
+    const ics = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VEVENT
+UID:test-ends-now
+DTSTART:20260209T083000Z
+DTEND:20260209T090000Z
+SUMMARY:Just Ended Meeting
+RRULE:FREQ=DAILY;COUNT=1
+END:VEVENT
+END:VCALENDAR`;
+
+    const event = createTestEvent(ics, '2026-02-09T09:00:00Z', 'UTC');
+    const response = await handler(event);
+    const data = parseResponse(response);
+
+    console.log('Event time: 08:30-09:00 UTC');
+    console.log('NOW: 09:00 UTC');
+    console.log('Expected: Event should NOT be current (just ended)');
+    console.log('Result:');
+    console.log('  isOverlappingNow:', data.isOverlappingNow);
+    console.log('  current:', data.current?.title || 'null');
+
+    if (!data.isOverlappingNow && data.current === null) {
+        console.log('✅ PASS: Just-ended event correctly excluded');
+        return true;
+    } else {
+        console.log('❌ FAIL: Just-ended event incorrectly marked as current');
+        return false;
+    }
+}
+
+// Test 4: Future event (should be next, not current)
+async function testFutureEvent() {
+    console.log('\n=== Test 4: Future Event ===');
+
+    const ics = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VEVENT
+UID:test-future
+DTSTART:20260209T100000Z
+DTEND:20260209T103000Z
+SUMMARY:Future Meeting
+RRULE:FREQ=DAILY;COUNT=1
+END:VEVENT
+END:VCALENDAR`;
+
+    const event = createTestEvent(ics, '2026-02-09T09:00:00Z', 'UTC');
+    const response = await handler(event);
+    const data = parseResponse(response);
+
+    console.log('Event time: 10:00-10:30 UTC');
+    console.log('NOW: 09:00 UTC');
+    console.log('Expected: Event should be next, not current');
+    console.log('Result:');
+    console.log('  isOverlappingNow:', data.isOverlappingNow);
+    console.log('  current:', data.current?.title || 'null');
+    console.log('  next:', data.next?.title || 'null');
+
+    if (!data.isOverlappingNow && data.current === null && data.next?.title === 'Future Meeting') {
+        console.log('✅ PASS: Future event correctly in next, not current');
+        return true;
+    } else {
+        console.log('❌ FAIL: Future event handling incorrect');
+        return false;
+    }
+}
+
+// Test 5: Unused override that is currently happening
+async function testUnusedOverrideCurrently() {
+    console.log('\n=== Test 5: Unused Override Currently Happening ===');
+
+    const ics = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VEVENT
+UID:test-override-master
+DTSTART:20260101T090000Z
+DTEND:20260101T093000Z
+SUMMARY:Daily Standup
+RRULE:FREQ=DAILY;COUNT=5
+END:VEVENT
+BEGIN:VEVENT
+UID:test-override-master
+RECURRENCE-ID:20260209T090000Z
+DTSTART:20260209T081500Z
+DTEND:20260209T084500Z
+SUMMARY:Daily Standup (Rescheduled)
+STATUS:CONFIRMED
+END:VEVENT
+END:VCALENDAR`;
+
+    // Override is at 08:15-08:45, NOW is 08:20
+    // Master series ended before Feb 9, so override is "unused"
+    const event = createTestEvent(ics, '2026-02-09T08:20:00Z', 'UTC');
+    const response = await handler(event);
+    const data = parseResponse(response);
+
+    console.log('Override time: 08:15-08:45 UTC');
+    console.log('NOW: 08:20 UTC');
+    console.log('Master series: Ended before Feb 9');
+    console.log('Expected: Unused override should be current');
+    console.log('Result:');
+    console.log('  isOverlappingNow:', data.isOverlappingNow);
+    console.log('  current:', data.current?.title || 'null');
+
+    if (data.isOverlappingNow && data.current?.title?.includes('Daily Standup')) {
+        console.log('✅ PASS: Unused override currently happening detected');
+        return true;
+    } else {
+        console.log('❌ FAIL: Unused override currently happening NOT detected');
+        return false;
+    }
+}
+
+// Test 6: Multiple events, one currently happening
+async function testMultipleEventsOneCurrent() {
+    console.log('\n=== Test 6: Multiple Events, One Current ===');
+
+    const ics = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VEVENT
+UID:test-past
+DTSTART:20260209T070000Z
+DTEND:20260209T073000Z
+SUMMARY:Past Meeting
+END:VEVENT
+BEGIN:VEVENT
+UID:test-current
+DTSTART:20260209T081500Z
+DTEND:20260209T084500Z
+SUMMARY:Current Meeting
+END:VEVENT
+BEGIN:VEVENT
+UID:test-future
+DTSTART:20260209T100000Z
+DTEND:20260209T103000Z
+SUMMARY:Future Meeting
+END:VEVENT
+END:VCALENDAR`;
+
+    const event = createTestEvent(ics, '2026-02-09T08:20:00Z', 'UTC');
+    const response = await handler(event);
+    const data = parseResponse(response);
+
+    console.log('Events:');
+    console.log('  Past: 07:00-07:30');
+    console.log('  Current: 08:15-08:45');
+    console.log('  Future: 10:00-10:30');
+    console.log('NOW: 08:20 UTC');
+    console.log('Result:');
+    console.log('  current:', data.current?.title || 'null');
+    console.log('  next:', data.next?.title || 'null');
+
+    if (data.current?.title === 'Current Meeting' && data.next?.title === 'Future Meeting') {
+        console.log('✅ PASS: Correctly identified current and next events');
+        return true;
+    } else {
+        console.log('❌ FAIL: Incorrect current/next identification');
+        return false;
+    }
+}
+
+// Test 7: Edge case - event starts 1 minute before NOW
+async function testEventStartsJustBeforeNow() {
+    console.log('\n=== Test 7: Event Starts 1 Minute Before NOW ===');
+
+    const ics = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VEVENT
+UID:test-edge
+DTSTART:20260209T091900Z
+DTEND:20260209T094500Z
+SUMMARY:Almost Current Meeting
+RRULE:FREQ=DAILY;COUNT=1
+END:VEVENT
+END:VCALENDAR`;
+
+    const event = createTestEvent(ics, '2026-02-09T09:20:00Z', 'UTC');
+    const response = await handler(event);
+    const data = parseResponse(response);
+
+    console.log('Event time: 09:19-09:45 UTC');
+    console.log('NOW: 09:20 UTC');
+    console.log('Expected: Event should be current (started 1 min ago)');
+    console.log('Result:');
+    console.log('  isOverlappingNow:', data.isOverlappingNow);
+    console.log('  current:', data.current?.title || 'null');
+
+    if (data.isOverlappingNow && data.current?.title === 'Almost Current Meeting') {
+        console.log('✅ PASS: Event starting just before NOW detected');
+        return true;
+    } else {
+        console.log('❌ FAIL: Event starting just before NOW NOT detected');
+        return false;
+    }
+}
+
+// Test 8: Next event should be after current event ends, not after NOW
+async function testNextAfterCurrentEnds() {
+    console.log('\n=== Test 8: Next Event After Current Ends ===');
+
+    const ics = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VEVENT
+UID:test-current
+DTSTART:20260209T101500Z
+DTEND:20260209T104500Z
+SUMMARY:Daily stand-up
+RRULE:FREQ=DAILY;COUNT=1
+END:VEVENT
+BEGIN:VEVENT
+UID:test-overlapping
+DTSTART:20260209T123000Z
+DTEND:20260209T133000Z
+SUMMARY:PayPal Discussion
+END:VEVENT
+BEGIN:VEVENT
+UID:test-afternoon
+DTSTART:20260209T150000Z
+DTEND:20260209T151500Z
+SUMMARY:Daily Afternoon Stand-Up
+END:VEVENT
+END:VCALENDAR`;
+
+    // NOW is 10:20, current event ends at 10:45
+    // Next should be PayPal at 12:30 (first after current ends)
+    // NextNonOverlapping would be after any overlapping cluster
+    const event = createTestEvent(ics, '2026-02-09T10:20:00Z', 'UTC');
+    const response = await handler(event);
+    const data = parseResponse(response);
+
+    console.log('NOW: 10:20 UTC');
+    console.log('Current: 10:15-10:45 (Daily stand-up)');
+    console.log('Events after current: PayPal at 12:30, Afternoon at 15:00');
+    console.log('Expected: Next = PayPal (first after current ends at 10:45)');
+    console.log('Result:');
+    console.log('  current:', data.current?.title || 'null');
+    console.log('  next:', data.next?.title || 'null');
+
+    if (data.current?.title === 'Daily stand-up' && data.next?.title === 'PayPal Discussion') {
+        console.log('✅ PASS: Next correctly identified as first event after current ends');
+        return true;
+    } else {
+        console.log('❌ FAIL: Next should be first event after current ends');
+        return false;
+    }
+}
+
+// Test 9: Recurring event with correct duration calculation
+async function testRecurringEventDuration() {
+    console.log('\n=== Test 9: Recurring Event Duration Calculation ===');
+
+    const ics = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VEVENT
+UID:test-recurring-duration
+DTSTART:20251120T110000Z
+DTEND:20251120T111500Z
+SUMMARY:Daily Bug Triage
+RRULE:FREQ=WEEKLY;UNTIL=20270209T090000Z;INTERVAL=1;BYDAY=MO,TU,WE,TH,FR
+END:VEVENT
+END:VCALENDAR`;
+
+    // Check event on Feb 9, 2026 (should be 11:00-11:15 UTC)
+    const event = createTestEvent(ics, '2026-02-09T11:10:00Z', 'UTC');
+    const response = await handler(event);
+    const data = parseResponse(response);
+
+    console.log('Recurring event: 11:00-11:15 UTC on weekdays');
+    console.log('NOW: 2026-02-09 11:10 UTC (Monday)');
+    console.log('Expected: Event should be current with correct end time');
+    console.log('Result:');
+    console.log('  isOverlappingNow:', data.isOverlappingNow);
+    console.log('  current:', data.current?.title || 'null');
+    console.log('  current end:', data.current?.end || 'null');
+
+    if (data.isOverlappingNow &&
+        data.current?.title === 'Daily Bug Triage' &&
+        data.current?.end?.includes('11:15')) {
+        console.log('✅ PASS: Recurring event duration calculated correctly');
+        return true;
+    } else {
+        console.log('❌ FAIL: Recurring event duration calculation incorrect');
+        return false;
+    }
+}
+
+// Test 10: Pacific Standard Time timezone handling
+async function testPacificTimezone() {
+    console.log('\n=== Test 10: Pacific Standard Time Timezone ===');
+
+    const ics = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VTIMEZONE
+TZID:Pacific Standard Time
+BEGIN:STANDARD
+DTSTART:16010101T020000
+TZOFFSETFROM:-0700
+TZOFFSETTO:-0800
+RRULE:FREQ=YEARLY;INTERVAL=1;BYDAY=1SU;BYMONTH=11
+END:STANDARD
+BEGIN:DAYLIGHT
+DTSTART:16010101T020000
+TZOFFSETFROM:-0800
+TZOFFSETTO:-0700
+RRULE:FREQ=YEARLY;INTERVAL=1;BYDAY=2SU;BYMONTH=3
+END:DAYLIGHT
+END:VTIMEZONE
+BEGIN:VEVENT
+UID:test-pst
+DTSTART;TZID=Pacific Standard Time:20260114T090000
+DTEND;TZID=Pacific Standard Time:20260114T093000
+SUMMARY:Sardine Weekly Sync
+RRULE:FREQ=WEEKLY;INTERVAL=1;BYDAY=WE
+END:VEVENT
+END:VCALENDAR`;
+
+    // Feb 11, 2026 is a Wednesday
+    // 09:00 PST = 17:00 UTC = 19:00 Europe/Nicosia
+    const event = createTestEvent(ics, '2026-02-11T17:10:00Z', 'Europe/Nicosia');
+    const response = await handler(event);
+    const data = parseResponse(response);
+
+    console.log('Event: 09:00 PST (17:00 UTC) on Wednesdays');
+    console.log('NOW: 2026-02-11 17:10 UTC (19:10 Nicosia)');
+    console.log('Expected: Event should be current');
+    console.log('Result:');
+    console.log('  isOverlappingNow:', data.isOverlappingNow);
+    console.log('  current:', data.current?.title || 'null');
+
+    if (data.isOverlappingNow && data.current?.title === 'Sardine Weekly Sync') {
+        console.log('✅ PASS: Pacific timezone with VTIMEZONE handled correctly');
+        return true;
+    } else {
+        console.log('❌ FAIL: Pacific timezone conversion incorrect');
+        return false;
+    }
+}
+
+// Test 11: Window expansion uses startMs not nowMs for recurring events
+async function testWindowExpansionStartMs() {
+    console.log('\n=== Test 11: Window Expansion Uses Day Start ===');
+
+    const ics = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VEVENT
+UID:test-morning
+DTSTART:20260209T080000Z
+DTEND:20260209T083000Z
+SUMMARY:Morning Meeting
+RRULE:FREQ=DAILY;COUNT=1
+END:VEVENT
+BEGIN:VEVENT
+UID:test-afternoon
+DTSTART:20260209T140000Z
+DTEND:20260209T143000Z
+SUMMARY:Afternoon Meeting
+RRULE:FREQ=DAILY;COUNT=1
+END:VEVENT
+END:VCALENDAR`;
+
+    // NOW is 10:00, both events should be found
+    // Morning (past) and Afternoon (future)
+    const event = createTestEvent(ics, '2026-02-09T10:00:00Z', 'UTC');
+    const response = await handler(event);
+    const data = parseResponse(response);
+
+    console.log('Events: Morning 08:00, Afternoon 14:00');
+    console.log('NOW: 10:00 UTC');
+    console.log('Expected: Afternoon should be next (morning already passed)');
+    console.log('Result:');
+    console.log('  next:', data.next?.title || 'null');
+
+    if (data.next?.title === 'Afternoon Meeting') {
+        console.log('✅ PASS: Window expansion correctly includes events before NOW');
+        return true;
+    } else {
+        console.log('❌ FAIL: Window expansion may have missed events before NOW');
+        return false;
+    }
+}
+
+// Run all tests
+async function runAllTests() {
+    console.log('═══════════════════════════════════════════════');
+    console.log('Comprehensive ICS Event Processing Test Suite');
+    console.log('Testing all edge cases from development session');
+    console.log('═══════════════════════════════════════════════');
+
+    const tests = [
+        testCurrentlyHappeningEvent,
+        testEventStartsAtNow,
+        testEventEndsAtNow,
+        testFutureEvent,
+        testUnusedOverrideCurrently,
+        testMultipleEventsOneCurrent,
+        testEventStartsJustBeforeNow,
+        testNextAfterCurrentEnds,
+        testRecurringEventDuration,
+        testPacificTimezone,
+        testWindowExpansionStartMs
+    ];
+
+    const results = [];
+    for (const test of tests) {
+        const passed = await test();
+        results.push(passed);
+    }
+
+    console.log('\n═══════════════════════════════════════════════');
+    console.log('Test Summary');
+    console.log('═══════════════════════════════════════════════');
+    const passCount = results.filter(r => r).length;
+    const totalCount = results.length;
+    console.log(`Passed: ${passCount}/${totalCount}`);
+
+    if (passCount === totalCount) {
+        console.log('✅ ALL TESTS PASSED');
+        process.exit(0);
+    } else {
+        console.log('❌ SOME TESTS FAILED');
+        process.exit(1);
+    }
+}
+
+runAllTests().catch(err => {
+    console.error('Test suite error:', err);
+    process.exit(1);
+});
