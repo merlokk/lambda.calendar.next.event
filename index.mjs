@@ -233,6 +233,33 @@ function normalizeIcsTimezones(icsText) {
     vtimezones.add(match[1]);
   }
 
+  // Add VTIMEZONE for Central Europe Standard Time if missing
+  if (!vtimezones.has("Central Europe Standard Time") &&
+      icsText.includes("TZID=Central Europe Standard Time")) {
+
+    const cetVTimezone = `
+BEGIN:VTIMEZONE
+TZID:Central Europe Standard Time
+BEGIN:STANDARD
+DTSTART:16010101T030000
+TZOFFSETFROM:+0200
+TZOFFSETTO:+0100
+RRULE:FREQ=YEARLY;INTERVAL=1;BYDAY=-1SU;BYMONTH=10
+END:STANDARD
+BEGIN:DAYLIGHT
+DTSTART:16010101T020000
+TZOFFSETFROM:+0100
+TZOFFSETTO:+0200
+RRULE:FREQ=YEARLY;INTERVAL=1;BYDAY=-1SU;BYMONTH=3
+END:DAYLIGHT
+END:VTIMEZONE
+`;
+
+    // Insert before first VEVENT
+    icsText = icsText.replace('BEGIN:VEVENT', cetVTimezone + 'BEGIN:VEVENT');
+    vtimezones.add("Central Europe Standard Time");
+  }
+
   return icsText.replaceAll(
       /TZID=([^:;\r\n]+)/g,
       (match, winTz) => {
@@ -256,6 +283,11 @@ function normalizeIcsTimezones(icsText) {
         // special-case for Pacific Standard Time
         if (winTz === "Pacific Standard Time") {
           return "TZID=America/Los_Angeles";
+        }
+
+        // special-case for Central Europe Standard Time
+        if (winTz === "Central Europe Standard Time") {
+          return "TZID=Europe/Warsaw";
         }
 
         log("DEBUG", "Mapped timezone", { from: winTz, to: list[0] });

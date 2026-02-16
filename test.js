@@ -500,6 +500,43 @@ END:VCALENDAR`;
     }
 }
 
+// Test 12: Central Europe Standard Time timezone handling
+async function testCentralEuropeTimezone() {
+    console.log('\n=== Test 12: Central Europe Standard Time Timezone ===');
+
+    const ics = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VEVENT
+UID:test-cet
+DTSTART;TZID=Central Europe Standard Time:20260216T163000
+DTEND;TZID=Central Europe Standard Time:20260216T170000
+SUMMARY:CET Meeting
+END:VEVENT
+END:VCALENDAR`;
+
+    // Feb 16, 2026 16:30 CET = 15:30 UTC
+    // Test at 15:35 UTC (should be current)
+    const event = createTestEvent(ics, '2026-02-16T15:35:00Z', 'Europe/Warsaw');
+    const response = await handler(event);
+    const data = parseResponse(response);
+
+    console.log('Event: 16:30 CET (15:30 UTC)');
+    console.log('NOW: 15:35 UTC');
+    console.log('Expected: Event should be current');
+    console.log('Result:');
+    console.log('  isOverlappingNow:', data.isOverlappingNow);
+    console.log('  current:', data.current?.title || 'null');
+
+    if (data.isOverlappingNow && data.current?.title === 'CET Meeting') {
+        console.log('✅ PASS: Central Europe timezone handled correctly');
+        return true;
+    } else {
+        console.log('❌ FAIL: Central Europe timezone conversion incorrect');
+        return false;
+    }
+}
+
 // Run all tests
 async function runAllTests() {
     console.log('═══════════════════════════════════════════════');
@@ -518,7 +555,8 @@ async function runAllTests() {
         testNextAfterCurrentEnds,
         testRecurringEventDuration,
         testPacificTimezone,
-        testWindowExpansionStartMs
+        testWindowExpansionStartMs,
+        testCentralEuropeTimezone
     ];
 
     const results = [];
