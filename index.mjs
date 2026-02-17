@@ -56,18 +56,32 @@ export const handler = async (event) => {
 
     // Parse query params for NOW override and timezone
     const params = event.queryStringParameters || {};
-    const nowOverride = params.now || OVERRIDE_NOW;
-    const tz = params.tz || TZ;
+    const hasNowOverride = typeof params.now === "string" && params.now.trim() !== "";
+    const hasTzOverride = typeof params.tz === "string" && params.tz.trim() !== "";
+    const nowOverride = hasNowOverride ? params.now : OVERRIDE_NOW;
+    const tz = hasTzOverride ? params.tz : TZ;
+
+    if (!isValidTimeZone(tz)) {
+      log("WARN", "Invalid timezone", { tz });
+      return json(400, { error: `Invalid timezone: ${tz}` });
+    }
 
     // Use overridden NOW for testing, otherwise real time
-    const nowMs = nowOverride ? new Date(nowOverride).getTime() : Date.now();
+    const nowMs = nowOverride ? parseIsoDateTime(nowOverride) : Date.now();
+
+    if (!Number.isFinite(nowMs)) {
+      log("WARN", "Invalid NOW override", { override: nowOverride });
+      return json(400, { error: `Invalid now override: ${nowOverride}` });
+    }
 
     if (nowOverride) {
       log("INFO", "Using overridden NOW", { override: nowOverride, nowMs: new Date(nowMs).toISOString() });
     }
 
-    // Only use cache for URL-based ICS (not inline test ICS)
-    if (!hasInlineIcs && cache.body && (nowMs - cache.at) < CACHE_MS) {
+    const hasQueryOverrides = hasNowOverride || hasTzOverride;
+
+    // Only use cache for URL-based ICS without query overrides.
+    if (!hasInlineIcs && !hasQueryOverrides && cache.body && (Date.now() - cache.at) < CACHE_MS) {
       log("DEBUG", "Cache hit");
       return json(200, cache.body, { "x-cache": "HIT" });
     }
@@ -176,7 +190,7 @@ export const handler = async (event) => {
 
     // Only cache URL-based results (not inline test ICS)
     if (!hasInlineIcs) {
-      cache = { at: nowMs, body };
+      cache = { at: Date.now(), body };
     }
 
     return json(200, body, { "x-cache": "MISS" });
@@ -649,6 +663,16 @@ function createComponentFromEvent(ev) {
   return comp;
 }
 
+function parseIsoDateTime(value) {
+  if (typeof value !== "string") return NaN;
+
+  // Avoid locale-dependent parsing: require explicit timezone.
+  const hasExplicitOffset = /([zZ]|[+-]\d{2}:\d{2})$/.test(value);
+  if (!hasExplicitOffset) return NaN;
+
+  return Date.parse(value);
+}
+
 function todayWindow(nowMs, timeZone) {
   const now = new Date(nowMs);
 
@@ -665,9 +689,23 @@ function todayWindow(nowMs, timeZone) {
 
   const approxUtcMidnight = new Date(`${y}-${m}-${d}T00:00:00Z`);
   const startMs = shiftUtcToZonedMidnightMs(approxUtcMidnight, timeZone);
-  const endMs = startMs + 24 * 60 * 60 * 1000;
+
+  // Next local midnight can be ±1h around DST transitions,
+  // so don't assume day length is always 24h.
+  const nextDayApproxUtcMidnight = new Date(`${y}-${m}-${d}T00:00:00Z`);
+  nextDayApproxUtcMidnight.setUTCDate(nextDayApproxUtcMidnight.getUTCDate() + 1);
+  const endMs = shiftUtcToZonedMidnightMs(nextDayApproxUtcMidnight, timeZone);
 
   return { startMs, endMs };
+}
+
+function isValidTimeZone(timeZone) {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function shiftUtcToZonedMidnightMs(utcMidnightDate, timeZone) {
