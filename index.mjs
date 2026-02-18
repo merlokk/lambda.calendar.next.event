@@ -225,6 +225,24 @@ async function fetchText(url, timeoutMs = 60000) {
 }
 
 function normalizeIcsTimezones(icsText) {
+  // Unfold lines according to RFC 5545 (CRLF + space/tab = continuation)
+  // This must be done before regex processing
+  icsText = icsText.replace(/\r?\n[ \t]/g, '');
+
+  // Decode quoted-printable in TZID values if present
+  // Outlook sometimes encodes timezone names (e.g., =3D for =, =20 for space)
+  icsText = icsText.replace(
+      /(TZID=)([^:;\r\n]+)/g,
+      (match, prefix, tzid) => {
+        // Decode common quoted-printable sequences
+        const decoded = tzid
+            .replace(/=3D/g, '=')
+            .replace(/=20/g, ' ')
+            .replace(/=([0-9A-F]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+        return prefix + decoded;
+      }
+  );
+
   // Extract all VTIMEZONE TZIDs from the file
   const vtzRegex = /BEGIN:VTIMEZONE[\s\S]*?TZID:([^\r\n]+)[\s\S]*?END:VTIMEZONE/g;
   const vtimezones = new Set();

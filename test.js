@@ -537,6 +537,83 @@ END:VCALENDAR`;
     }
 }
 
+// Test 13: Folded lines (RFC 5545 line continuation)
+async function testFoldedLines() {
+    console.log('\n=== Test 13: Folded Lines (RFC 5545) ===');
+
+    // ICS with folded UID and DESCRIPTION (space at start of continuation line)
+    const ics = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VEVENT
+UID:very-long-uid-that-spans-multiple-lines-12345678901234567890123456789012
+ 34567890
+DTSTART:20260209T100000Z
+DTEND:20260209T103000Z
+SUMMARY:Folded Event
+DESCRIPTION:This is a very long description that will be folded across multi
+ ple lines according to RFC 5545 specifications for line folding in iCalenda
+ r format files.
+END:VEVENT
+END:VCALENDAR`;
+
+    const event = createTestEvent(ics, '2026-02-09T10:15:00Z', 'UTC');
+    const response = await handler(event);
+    const data = parseResponse(response);
+
+    console.log('Event with folded UID and DESCRIPTION');
+    console.log('NOW: 10:15 UTC (during event)');
+    console.log('Expected: Event should be current');
+    console.log('Result:');
+    console.log('  isOverlappingNow:', data.isOverlappingNow);
+    console.log('  current:', data.current?.title || 'null');
+
+    if (data.isOverlappingNow && data.current?.title === 'Folded Event') {
+        console.log('✅ PASS: Folded lines handled correctly');
+        return true;
+    } else {
+        console.log('❌ FAIL: Folded lines not parsed correctly');
+        return false;
+    }
+}
+
+// Test 14: Quoted-printable encoding in timezone names (Outlook)
+async function testQuotedPrintableTimezone() {
+    console.log('\n=== Test 14: Quoted-Printable Timezone (Outlook) ===');
+
+    // Timezone name encoded as quoted-printable: =20 for space, =3D for =
+    const ics = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Microsoft Corporation//Outlook 16.0 MIMEDIR//EN
+BEGIN:VEVENT
+UID:test-qp-tz
+DTSTART;TZID=Central=20Europe=20Standard=20Time:20260216T163000
+DTEND;TZID=Central=20Europe=20Standard=20Time:20260216T170000
+SUMMARY:QP Encoded Meeting
+END:VEVENT
+END:VCALENDAR`;
+
+    // Feb 16, 2026 16:30 CET = 15:30 UTC
+    const event = createTestEvent(ics, '2026-02-16T15:35:00Z', 'Europe/Warsaw');
+    const response = await handler(event);
+    const data = parseResponse(response);
+
+    console.log('Event: 16:30 CET with quoted-printable encoding (=20 for space)');
+    console.log('NOW: 15:35 UTC');
+    console.log('Expected: Event should be current');
+    console.log('Result:');
+    console.log('  isOverlappingNow:', data.isOverlappingNow);
+    console.log('  current:', data.current?.title || 'null');
+
+    if (data.isOverlappingNow && data.current?.title === 'QP Encoded Meeting') {
+        console.log('✅ PASS: Quoted-printable timezone decoded correctly');
+        return true;
+    } else {
+        console.log('❌ FAIL: Quoted-printable timezone not decoded');
+        return false;
+    }
+}
+
 // Run all tests
 async function runAllTests() {
     console.log('═══════════════════════════════════════════════');
@@ -556,7 +633,9 @@ async function runAllTests() {
         testRecurringEventDuration,
         testPacificTimezone,
         testWindowExpansionStartMs,
-        testCentralEuropeTimezone
+        testCentralEuropeTimezone,
+        testFoldedLines,
+        testQuotedPrintableTimezone
     ];
 
     const results = [];
